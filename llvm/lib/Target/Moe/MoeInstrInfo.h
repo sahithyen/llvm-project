@@ -1,0 +1,100 @@
+//===-- MoeInstrInfo.h - Moe Instruction Information -------------*- C++ -*-===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file contains the Moe implementation of the TargetInstrInfo class.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef LLVM_LIB_TARGET_MOE_MOEINSTRINFO_H
+#define LLVM_LIB_TARGET_MOE_MOEINSTRINFO_H
+
+#include "MoeRegisterInfo.h"
+#include "llvm/CodeGen/TargetInstrInfo.h"
+
+#define GET_INSTRINFO_HEADER
+#include "MoeGenInstrInfo.inc"
+
+namespace llvm {
+
+class MoeSubtarget;
+
+// Moe's own condition codes, matching 'Condition selection' in the Encoding
+// chapter numerically (see MOECC_* in MoeInstrFormats.td).
+namespace MoeCC {
+enum CondCodes {
+  COND_AL = 0,
+  COND_NV = 1,
+  COND_EQ = 2,
+  COND_NE = 3,
+  COND_CS = 4,
+  COND_CC = 5,
+  COND_MI = 6,
+  COND_PL = 7,
+  COND_VS = 8,
+  COND_VC = 9,
+  COND_HI = 10,
+  COND_LS = 11,
+  COND_GE = 12,
+  COND_LT = 13,
+  COND_GT = 14,
+  COND_LE = 15,
+
+  COND_INVALID = -1
+};
+}
+
+class MoeInstrInfo : public MoeGenInstrInfo {
+  const MoeRegisterInfo RI;
+  virtual void anchor();
+
+public:
+  explicit MoeInstrInfo(const MoeSubtarget &STI);
+
+  const MoeRegisterInfo &getRegisterInfo() const { return RI; }
+
+  bool expandPostRAPseudo(MachineInstr &MI) const override;
+
+  void copyPhysReg(MachineBasicBlock &MBB, MachineBasicBlock::iterator I,
+                    const DebugLoc &DL, Register DestReg, Register SrcReg,
+                    bool KillSrc, bool RenamableDest = false,
+                    bool RenamableSrc = false) const override;
+
+  void storeRegToStackSlot(
+      MachineBasicBlock &MBB, MachineBasicBlock::iterator MI, Register SrcReg,
+      bool isKill, int FrameIndex, const TargetRegisterClass *RC,
+      Register VReg,
+      MachineInstr::MIFlag Flags = MachineInstr::NoFlags) const override;
+  void loadRegFromStackSlot(
+      MachineBasicBlock &MBB, MachineBasicBlock::iterator MI, Register DestReg,
+      int FrameIdx, const TargetRegisterClass *RC, Register VReg,
+      unsigned SubReg = 0,
+      MachineInstr::MIFlag Flags = MachineInstr::NoFlags) const override;
+
+  bool
+  reverseBranchCondition(SmallVectorImpl<MachineOperand> &Cond) const override;
+  bool analyzeBranch(MachineBasicBlock &MBB, MachineBasicBlock *&TBB,
+                      MachineBasicBlock *&FBB,
+                      SmallVectorImpl<MachineOperand> &Cond,
+                      bool AllowModify) const override;
+  unsigned removeBranch(MachineBasicBlock &MBB,
+                        int *BytesRemoved = nullptr) const override;
+  unsigned insertBranch(MachineBasicBlock &MBB, MachineBasicBlock *TBB,
+                        MachineBasicBlock *FBB, ArrayRef<MachineOperand> Cond,
+                        const DebugLoc &DL,
+                        int *BytesAdded = nullptr) const override;
+
+  int64_t getFramePoppedByCallee(const MachineInstr &I) const {
+    assert(isFrameInstr(I) && "Not a frame instruction");
+    assert(I.getOperand(1).getImm() >= 0 && "Size must not be negative");
+    return I.getOperand(1).getImm();
+  }
+};
+
+} // namespace llvm
+
+#endif

@@ -579,6 +579,13 @@ std::string Triple::computeDataLayout(StringRef ABIName) const {
   case Triple::mips64:
   case Triple::mips64el:
     return computeMipsDataLayout(*this, ABIName);
+  case Triple::moe:
+    // 32-bit registers/pointers, natural byte/halfword/word alignment
+    // matching the ISA's own alignment-fault rules (see 'Memory alignment'
+    // in the Encoding chapter) - nothing wider than a word is natively
+    // aligned since PUSH/POP and SP always move by exactly one word.
+    return "e-m:e-p:32:32-i8:8-i16:16-i32:32-i64:32-f32:32-f64:32-a:8-"
+           "n8:16:32-S32";
   case Triple::msp430:
     return "e-m:e-p:16:16-i32:16-i64:16-f32:16-f64:16-a:8-n8:16-S16";
   case Triple::ppc:
