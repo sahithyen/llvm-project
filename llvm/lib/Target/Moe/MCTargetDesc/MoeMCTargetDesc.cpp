@@ -78,4 +78,6 @@ LLVMInitializeMoeTargetMC() {
   TargetRegistry::RegisterMCRegInfo(T, createMoeMCRegisterInfo);
   TargetRegistry::RegisterMCSubtargetInfo(T, createMoeMCSubtargetInfo);
   TargetRegistry::RegisterMCInstPrinter(T, createMoeMCInstPrinter);
+  TargetRegistry::RegisterMCCodeEmitter(T, createMoeMCCodeEmitter);
+  TargetRegistry::RegisterMCAsmBackend(T, createMoeMCAsmBackend);
 }

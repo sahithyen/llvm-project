@@ -14,14 +14,34 @@
 #define LLVM_LIB_TARGET_MOE_MCTARGETDESC_MOEMCTARGETDESC_H
 
 #include "llvm/Support/DataTypes.h"
+#include <memory>
 
 namespace llvm {
 class Target;
+class MCAsmBackend;
+class MCCodeEmitter;
+class MCContext;
+class MCInstrInfo;
+class MCObjectTargetWriter;
+class MCRegisterInfo;
+class MCSubtargetInfo;
+class MCTargetOptions;
 
-// Milestone 1 is scoped to `llc -filetype=asm` (assembly text) only, so no
-// MCCodeEmitter/MCAsmBackend/ELFObjectWriter exist yet - real binary
-// encoding (needed for -filetype=obj) is deferred to a later milestone, see
-// the Milestone 1 plan's MC-layer notes.
+/// Creates a machine code emitter for Moe - see MoeMCCodeEmitter.cpp.
+MCCodeEmitter *createMoeMCCodeEmitter(const MCInstrInfo &MCII, MCContext &Ctx);
+
+/// Resets an MCCodeEmitter's per-function trailing-operand-alignment byte
+/// counter - called from MoeAsmPrinter::emitFunctionBodyStart, since every
+/// function is guaranteed word-aligned (see MoeISelLowering's
+/// setMinFunctionAlignment) but the encoder can't otherwise tell where one
+/// function's byte stream ends and the next begins.
+void resetMoeCodeEmitterOffset(MCCodeEmitter &MCE);
+
+MCAsmBackend *createMoeMCAsmBackend(const Target &T, const MCSubtargetInfo &STI,
+                                     const MCRegisterInfo &MRI,
+                                     const MCTargetOptions &Options);
+
+std::unique_ptr<MCObjectTargetWriter> createMoeELFObjectWriter();
 
 } // namespace llvm
 

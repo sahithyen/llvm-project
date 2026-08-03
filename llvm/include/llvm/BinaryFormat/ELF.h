@@ -325,6 +325,14 @@ enum {
   EM_VE = 251,            // NEC SX-Aurora VE
   EM_CSKY = 252,          // C-SKY 32-bit processor
   EM_LOONGARCH = 258,     // LoongArch
+
+  // Not an officially assigned ELF machine type - Moe is a from-scratch,
+  // unregistered ISA (see CLAUDE.md) that will never need interop with
+  // real-world ELF consumers expecting an official machine type. Chosen
+  // deliberately far outside the assigned range above (0x4D4F = "MO" in
+  // hex, self-documenting in a hex dump) to avoid any collision with a
+  // future real assignment.
+  EM_MOE = 0x4D4F,
 };
 
 // Object file classes.
@@ -1032,6 +1040,11 @@ enum {
 // ELF Relocation type for VE.
 enum {
 #include "ELFRelocs/VE.def"
+};
+
+// ELF Relocation types for Moe.
+enum {
+#include "ELFRelocs/Moe.def"
 };
 
 // CSKY Specific e_flags

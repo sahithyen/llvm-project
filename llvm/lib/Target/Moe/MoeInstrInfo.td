@@ -148,7 +148,12 @@ def SUB : AddSubForm<0b1010, (outs GPR:$o), (ins GPR:$a, GPR:$b),
 // compare is a real SUB whose result goes to a dead scratch register and
 // only the flags are consumed - see the Milestone 1 plan's ABI/instruction
 // selection notes.
-let isCompare = 1 in
+// Real hardware SUB always writes its 3-bit `o` field to some GP register
+// (unlike AND/OR/XOR/SHIFT, SUB has no Test-mode result-discard bit) - since
+// this pseudo's result is never used, `o` is just hardcoded to GP0 (0),
+// mirroring Test mode's own "O must be encoded as 0" convention for a
+// discarded result.
+let isCompare = 1, o = 0 in
 def SUBcmp : AddSubForm<0b1010, (outs), (ins GPR:$a, GPR:$b),
                          "sub $a, $b -> (dead)", [(Moecmp GPR:$a, GPR:$b)]>;
 

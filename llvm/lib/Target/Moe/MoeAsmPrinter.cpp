@@ -13,13 +13,19 @@
 //===----------------------------------------------------------------------===//
 
 #include "MCTargetDesc/MoeInstPrinter.h"
+#include "MCTargetDesc/MoeMCTargetDesc.h"
+#include "MoeConstantPoolValue.h"
 #include "MoeMCInstLower.h"
 #include "MoeTargetMachine.h"
 #include "TargetInfo/MoeTargetInfo.h"
 #include "llvm/CodeGen/AsmPrinter.h"
 #include "llvm/CodeGen/MachineInstr.h"
+#include "llvm/MC/MCAssembler.h"
+#include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCInst.h"
+#include "llvm/MC/MCObjectStreamer.h"
 #include "llvm/MC/MCStreamer.h"
+#include "llvm/MC/MCSymbol.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/Compiler.h"
 
@@ -35,11 +41,28 @@ public:
 
   StringRef getPassName() const override { return "Moe Assembly Printer"; }
 
+  void emitFunctionBodyStart() override;
   void emitInstruction(const MachineInstr *MI) override;
+  void emitMachineConstantPoolValue(MachineConstantPoolValue *MCPV) override;
 
   static char ID;
 };
 } // end anonymous namespace
+
+void MoeAsmPrinter::emitFunctionBodyStart() {
+  // The encoder tracks each function's running byte offset (to know when a
+  // trailing operand word needs alignment padding - see the Milestone 2
+  // plan) relative to this function's start, which setMinFunctionAlignment
+  // guarantees is word-aligned. Only meaningful for -filetype=obj (an
+  // MCObjectStreamer, which has no RTTI classof - detect it the same way
+  // MCStreamer itself distinguishes object streamers from
+  // MCAsmStreamer: hasRawTextSupport() is false only for the former);
+  // -filetype=asm never calls the code emitter at all.
+  if (!OutStreamer->hasRawTextSupport()) {
+    auto *OS = static_cast<MCObjectStreamer *>(OutStreamer.get());
+    resetMoeCodeEmitterOffset(OS->getAssembler().getEmitter());
+  }
+}
 
 void MoeAsmPrinter::emitInstruction(const MachineInstr *MI) {
   MoeMCInstLower MCInstLowering(OutContext, *this);
@@ -47,6 +70,13 @@ void MoeAsmPrinter::emitInstruction(const MachineInstr *MI) {
   MCInst TmpInst;
   MCInstLowering.Lower(MI, TmpInst);
   EmitToStreamer(*OutStreamer, TmpInst);
+}
+
+void MoeAsmPrinter::emitMachineConstantPoolValue(
+    MachineConstantPoolValue *MCPV) {
+  auto *CPV = static_cast<MoeConstantPoolValue *>(MCPV);
+  const MCExpr *Expr = MCSymbolRefExpr::create(CPV->getSymbol(), OutContext);
+  OutStreamer->emitValue(Expr, getDataLayout().getTypeAllocSize(CPV->getType()));
 }
 
 char MoeAsmPrinter::ID = 0;

@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "MoeISelLowering.h"
+#include "MoeConstantPoolValue.h"
 #include "MoeMachineFunctionInfo.h"
 #include "MoeSubtarget.h"
 #include "MoeTargetMachine.h"
@@ -36,6 +37,14 @@ MoeTargetLowering::MoeTargetLowering(const TargetMachine &TM,
 
   setStackPointerRegisterToSaveRestore(Moe::SP);
   setBooleanContents(ZeroOrOneBooleanContent);
+
+  // JUMP/LOAD/STORE's trailing operand word must land on a word-aligned
+  // address (see 'Addressing mode' in the Encoding chapter); the MC-layer
+  // encoder (Milestone 2) decides padding by tracking each function's
+  // running byte offset from a known-aligned start, which only works if
+  // that start is actually guaranteed word-aligned.
+  setMinFunctionAlignment(Align(4));
+  setPrefFunctionAlignment(Align(4));
 
   // No load-immediate instruction - every constant materializes via the
   // literal pool (see the Milestone 1 plan's "Constant materialization").
@@ -91,11 +100,12 @@ SDValue MoeTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
 }
 
 //===----------------------------------------------------------------------===//
-// Constant materialization - every constant (including the call sequence's
-// return-address label materialized directly via BuildMI, not through this
-// path) goes through a MachineConstantPool entry read by LOADabs. A
-// GlobalValue is itself a Constant, so LowerGlobalAddress reuses the exact
-// same TargetConstantPool + Wrapper mechanism.
+// Constant materialization - every constant, including the call sequence's
+// return-address label (via MoeConstantPoolValue, built directly at the
+// MachineInstr level in emitCall since it never goes through SelectionDAG),
+// goes through a MachineConstantPool entry read by LOADabs. A GlobalValue is
+// itself a Constant, so LowerGlobalAddress reuses the exact same
+// TargetConstantPool + Wrapper mechanism.
 //===----------------------------------------------------------------------===//
 
 SDValue MoeTargetLowering::LowerConstantPool(SDValue Op,
@@ -444,8 +454,18 @@ MachineBasicBlock *MoeTargetLowering::emitCall(MachineInstr &MI,
   // sequence design.
   MCSymbol *RetSym = MF->getContext().createTempSymbol("callret", true);
 
-  // LOAD.W [RetSym] -> GP4 ; PUSH.W GP4 ; JUMP.AL [callee] ; RetSym:
-  BuildMI(*BB, MI, DL, TII->get(Moe::LOADabs), Moe::GP4).addSym(RetSym);
+  // LOADabs always dereferences its trailing address operand (loads
+  // memory[addr], not addr itself - see the spec's LOAD section), so getting
+  // RetSym's address as a *value* into GP4 needs the same pool indirection
+  // every other constant goes through (LowerConstantPool/LowerGlobalAddress):
+  // a pool slot holding RetSym's address, read through by LOADabs.
+  Type *PtrTy = Type::getInt32Ty(MF->getFunction().getContext());
+  MoeConstantPoolValue *CPV = MoeConstantPoolValue::Create(PtrTy, RetSym);
+  unsigned CPIdx = MF->getConstantPool()->getConstantPoolIndex(CPV, Align(4));
+
+  // LOAD.W [pool entry containing RetSym] -> GP4 ; PUSH.W GP4 ; JUMP.AL [callee] ; RetSym:
+  BuildMI(*BB, MI, DL, TII->get(Moe::LOADabs), Moe::GP4)
+      .addConstantPoolIndex(CPIdx);
   BuildMI(*BB, MI, DL, TII->get(Moe::PUSH)).addReg(Moe::GP4, RegState::Kill);
   MachineInstrBuilder MIB =
       BuildMI(*BB, MI, DL, TII->get(Moe::JMPabs)).add(MI.getOperand(0));
