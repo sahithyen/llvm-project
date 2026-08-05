@@ -65,12 +65,16 @@ MoeTargetLowering::MoeTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::SRL, MVT::i32, Custom);
   setOperationAction(ISD::SRA, MVT::i32, Custom);
 
-  // No hardware multiply/divide.
-  setOperationAction(ISD::MUL, MVT::i32, LibCall);
-  setOperationAction(ISD::SDIV, MVT::i32, LibCall);
-  setOperationAction(ISD::UDIV, MVT::i32, LibCall);
-  setOperationAction(ISD::SREM, MVT::i32, LibCall);
-  setOperationAction(ISD::UREM, MVT::i32, LibCall);
+  // No hardware multiply/divide, and no runtime library exists to LibCall
+  // out to (see the Milestone 3 plan) - all five are expanded in-backend
+  // into software loops: MUL (LowerMUL/emitMul), UDIV/UREM (LowerUDIV/
+  // LowerUREM/emitDivRem), and SDIV/SREM (LowerSDIV/LowerSREM/emitSDivRem,
+  // which wraps emitDivRem's unsigned core with sign correction).
+  setOperationAction(ISD::MUL, MVT::i32, Custom);
+  setOperationAction(ISD::SDIV, MVT::i32, Custom);
+  setOperationAction(ISD::UDIV, MVT::i32, Custom);
+  setOperationAction(ISD::SREM, MVT::i32, Custom);
+  setOperationAction(ISD::UREM, MVT::i32, Custom);
 
   setOperationAction(ISD::DYNAMIC_STACKALLOC, MVT::i32, Expand);
   setOperationAction(ISD::STACKSAVE, MVT::Other, Expand);
@@ -94,6 +98,16 @@ SDValue MoeTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
     return LowerGlobalAddress(Op, DAG);
   case ISD::BR_CC:
     return LowerBR_CC(Op, DAG);
+  case ISD::MUL:
+    return LowerMUL(Op, DAG);
+  case ISD::UDIV:
+    return LowerUDIV(Op, DAG);
+  case ISD::UREM:
+    return LowerUREM(Op, DAG);
+  case ISD::SDIV:
+    return LowerSDIV(Op, DAG);
+  case ISD::SREM:
+    return LowerSREM(Op, DAG);
   default:
     llvm_unreachable("unimplemented operand");
   }
@@ -247,6 +261,67 @@ SDValue MoeTargetLowering::LowerBR_CC(SDValue Op, SelectionDAG &DAG) const {
   SDValue Flag = DAG.getNode(MoeISD::CMP, dl, MVT::Glue, LHS, RHS);
   return DAG.getNode(MoeISD::BR_CC, dl, Op.getValueType(), Chain, Dest,
                       TargetCC, Flag);
+}
+
+//===----------------------------------------------------------------------===//
+// Multiply - no hardware MUL and no runtime library exists (see the
+// Milestone 3 plan), so this constructs MULPSEUDO directly as a machine
+// node (bypassing SelectionDAG pattern matching entirely, since LowerMUL
+// already has exactly the two operands the pseudo needs) - emitMul expands
+// it into a real shift-and-add loop after instruction selection.
+//===----------------------------------------------------------------------===//
+
+SDValue MoeTargetLowering::LowerMUL(SDValue Op, SelectionDAG &DAG) const {
+  SDLoc dl(Op);
+  SDValue LHS = Op.getOperand(0);
+  SDValue RHS = Op.getOperand(1);
+  return SDValue(DAG.getMachineNode(Moe::MULPSEUDO, dl, MVT::i32, LHS, RHS),
+                 0);
+}
+
+//===----------------------------------------------------------------------===//
+// Unsigned divide/remainder - both construct the same DIVMODPSEUDO machine
+// node (built directly, not matched via a SelectionDAG Pat, same as MUL)
+// and just pick a different result index; if UDIV and UREM of the same
+// operands both appear, SelectionDAG's node uniquing naturally fuses them
+// into one loop. emitDivRem does the actual restoring-division expansion.
+//===----------------------------------------------------------------------===//
+
+SDValue MoeTargetLowering::LowerUDIV(SDValue Op, SelectionDAG &DAG) const {
+  SDLoc dl(Op);
+  SDVTList VTs = DAG.getVTList(MVT::i32, MVT::i32);
+  SDValue Ops[] = {Op.getOperand(0), Op.getOperand(1)};
+  SDNode *N = DAG.getMachineNode(Moe::DIVMODPSEUDO, dl, VTs, Ops);
+  return SDValue(N, 0);
+}
+
+SDValue MoeTargetLowering::LowerUREM(SDValue Op, SelectionDAG &DAG) const {
+  SDLoc dl(Op);
+  SDVTList VTs = DAG.getVTList(MVT::i32, MVT::i32);
+  SDValue Ops[] = {Op.getOperand(0), Op.getOperand(1)};
+  SDNode *N = DAG.getMachineNode(Moe::DIVMODPSEUDO, dl, VTs, Ops);
+  return SDValue(N, 1);
+}
+
+//===----------------------------------------------------------------------===//
+// Signed divide/remainder - same construction as UDIV/UREM, but via
+// SDIVMODPSEUDO (emitSDivRem wraps the unsigned core with sign correction).
+//===----------------------------------------------------------------------===//
+
+SDValue MoeTargetLowering::LowerSDIV(SDValue Op, SelectionDAG &DAG) const {
+  SDLoc dl(Op);
+  SDVTList VTs = DAG.getVTList(MVT::i32, MVT::i32);
+  SDValue Ops[] = {Op.getOperand(0), Op.getOperand(1)};
+  SDNode *N = DAG.getMachineNode(Moe::SDIVMODPSEUDO, dl, VTs, Ops);
+  return SDValue(N, 0);
+}
+
+SDValue MoeTargetLowering::LowerSREM(SDValue Op, SelectionDAG &DAG) const {
+  SDLoc dl(Op);
+  SDVTList VTs = DAG.getVTList(MVT::i32, MVT::i32);
+  SDValue Ops[] = {Op.getOperand(0), Op.getOperand(1)};
+  SDNode *N = DAG.getMachineNode(Moe::SDIVMODPSEUDO, dl, VTs, Ops);
+  return SDValue(N, 1);
 }
 
 //===----------------------------------------------------------------------===//
@@ -433,6 +508,12 @@ MoeTargetLowering::EmitInstrWithCustomInserter(MachineInstr &MI,
   switch (MI.getOpcode()) {
   case Moe::CALL:
     return emitCall(MI, BB);
+  case Moe::MULPSEUDO:
+    return emitMul(MI, BB);
+  case Moe::DIVMODPSEUDO:
+    return emitDivRem(MI, BB);
+  case Moe::SDIVMODPSEUDO:
+    return emitSDivRem(MI, BB);
   default:
     llvm_unreachable("Unexpected instr type to insert");
   }
@@ -477,4 +558,607 @@ MachineBasicBlock *MoeTargetLowering::emitCall(MachineInstr &MI,
 
   MI.eraseFromParent();
   return BB;
+}
+
+//===----------------------------------------------------------------------===//
+// Software multiply - SHIFT moves exactly one bit per instruction (see the
+// spec's SHIFT section) and its carry-out is the bit shifted out, so this
+// loop tests each multiplier bit directly off SHIFT's C flag: no separate
+// AND-with-1 masking instruction needed (and AND has no immediate-mask form
+// anyway) - see the Milestone 3 plan's "Software multiply" section.
+//
+// Blocks (BB is MULPSEUDO's parent block, split at the pseudo):
+//   BB:         multiplicand/multiplier copies, result/counter/bound seeded
+//               via self-XOR (always zero, regardless of the register's
+//               prior value - there's no load-immediate instruction) and
+//               INCREMENT's immediate field (bound = 32); falls through to
+//               LoopBB.
+//   LoopBB:     shift multiplier right by 1 (C = old bit0); if C is clear,
+//               branch straight to ContinueBB (skip the add); otherwise
+//               fall through to AddBB.
+//   AddBB:      result += multiplicand; falls through to ContinueBB.
+//   ContinueBB: merges result (PHI: unchanged value from LoopBB's skip edge,
+//               or AddBB's updated value); shifts multiplicand left by 1;
+//               increments counter; compares counter against bound (32);
+//               loops back to LoopBB while not equal, else falls through to
+//               ExitBB.
+//   ExitBB:     receives MULPSEUDO's original successors; copies the final
+//               result into MULPSEUDO's original destination register.
+//
+// Flags are always consumed by the very next instruction after whatever set
+// them (SHIFT's C by the immediately-following JCC.CC; the counter/bound
+// SUBcmp's Z by the immediately-following JCC.NE), with nothing else
+// touching F in between - so no flag-preservation trick is needed despite
+// ADD/SHIFT/INCREMENT all clobbering S/Z/C/O as a side effect.
+//===----------------------------------------------------------------------===//
+
+MachineBasicBlock *MoeTargetLowering::emitMul(MachineInstr &MI,
+                                               MachineBasicBlock *BB) const {
+  const TargetInstrInfo *TII = BB->getParent()->getSubtarget().getInstrInfo();
+  DebugLoc DL = MI.getDebugLoc();
+  MachineFunction *MF = BB->getParent();
+  MachineRegisterInfo &MRI = MF->getRegInfo();
+  const TargetRegisterClass *RC = &Moe::GPRRegClass;
+
+  Register DstReg = MI.getOperand(0).getReg();
+  Register AReg = MI.getOperand(1).getReg();
+  Register BReg = MI.getOperand(2).getReg();
+
+  const BasicBlock *LLVM_BB = BB->getBasicBlock();
+  MachineFunction::iterator InsertPt = ++BB->getIterator();
+  MachineBasicBlock *LoopBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *AddBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *ContinueBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *ExitBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MF->insert(InsertPt, LoopBB);
+  MF->insert(InsertPt, AddBB);
+  MF->insert(InsertPt, ContinueBB);
+  MF->insert(InsertPt, ExitBB);
+
+  ExitBB->splice(ExitBB->begin(), BB,
+                 std::next(MachineBasicBlock::iterator(MI)), BB->end());
+  ExitBB->transferSuccessorsAndUpdatePHIs(BB);
+
+  BB->addSuccessor(LoopBB);
+  LoopBB->addSuccessor(ContinueBB); // carry clear: skip the add
+  LoopBB->addSuccessor(AddBB);      // carry set: fall through to the add
+  AddBB->addSuccessor(ContinueBB);
+  ContinueBB->addSuccessor(LoopBB); // counter != bound: loop back
+  ContinueBB->addSuccessor(ExitBB); // counter == bound: done
+
+  // Every virtual register the loop touches is declared up front so PHIs
+  // can reference values defined later in program order (the back-edge
+  // inputs from ContinueBB), matching the same forward-declaration
+  // technique MSP430's EmitShiftInstr uses for its shift-amount/shift-value
+  // PHIs.
+  Register Multiplicand0 = MRI.createVirtualRegister(RC);
+  Register Multiplier0 = MRI.createVirtualRegister(RC);
+  Register Result0 = MRI.createVirtualRegister(RC);
+  Register Counter0 = MRI.createVirtualRegister(RC);
+  Register Bound = MRI.createVirtualRegister(RC);
+
+  Register MultiplicandPhi = MRI.createVirtualRegister(RC);
+  Register MultiplierPhi = MRI.createVirtualRegister(RC);
+  Register ResultPhi = MRI.createVirtualRegister(RC);
+  Register CounterPhi = MRI.createVirtualRegister(RC);
+  Register MultiplierNext = MRI.createVirtualRegister(RC);
+  Register ResultAdded = MRI.createVirtualRegister(RC);
+  Register ResultNext = MRI.createVirtualRegister(RC);
+  Register MultiplicandNext = MRI.createVirtualRegister(RC);
+  Register CounterNext = MRI.createVirtualRegister(RC);
+  Register BoundZero = MRI.createVirtualRegister(RC);
+
+  // BB
+  BuildMI(*BB, MI, DL, TII->get(TargetOpcode::COPY), Multiplicand0)
+      .addReg(AReg);
+  BuildMI(*BB, MI, DL, TII->get(TargetOpcode::COPY), Multiplier0)
+      .addReg(BReg);
+  BuildMI(*BB, MI, DL, TII->get(Moe::XOR), Result0)
+      .addReg(Multiplicand0)
+      .addReg(Multiplicand0);
+  BuildMI(*BB, MI, DL, TII->get(Moe::XOR), Counter0)
+      .addReg(Multiplicand0)
+      .addReg(Multiplicand0);
+  // Bound = 32: INCREMENT's tied "$o = $oin" constraint needs oin to be a
+  // *different* SSA value than the fresh result register it defines - see
+  // the Milestone 3 plan/emitSDivRem's verifier-caught bug note - so the
+  // zeroed seed (BoundZero) and the incremented result (Bound) must be
+  // distinct virtual registers, not the same one reused in place.
+  BuildMI(*BB, MI, DL, TII->get(Moe::XOR), BoundZero)
+      .addReg(Multiplicand0)
+      .addReg(Multiplicand0);
+  BuildMI(*BB, MI, DL, TII->get(Moe::INCREMENT), Bound)
+      .addReg(BoundZero)
+      .addImm(32);
+
+  // LoopBB: MultiplicandPhi/CounterPhi/ResultPhi's back-edge values are
+  // defined in ContinueBB; MultiplierPhi's back-edge value (MultiplierNext)
+  // is defined right here in LoopBB and simply flows unchanged through
+  // AddBB/ContinueBB back to this PHI.
+  BuildMI(LoopBB, DL, TII->get(TargetOpcode::PHI), MultiplicandPhi)
+      .addReg(Multiplicand0).addMBB(BB)
+      .addReg(MultiplicandNext).addMBB(ContinueBB);
+  BuildMI(LoopBB, DL, TII->get(TargetOpcode::PHI), MultiplierPhi)
+      .addReg(Multiplier0).addMBB(BB)
+      .addReg(MultiplierNext).addMBB(ContinueBB);
+  BuildMI(LoopBB, DL, TII->get(TargetOpcode::PHI), ResultPhi)
+      .addReg(Result0).addMBB(BB)
+      .addReg(ResultNext).addMBB(ContinueBB);
+  BuildMI(LoopBB, DL, TII->get(TargetOpcode::PHI), CounterPhi)
+      .addReg(Counter0).addMBB(BB)
+      .addReg(CounterNext).addMBB(ContinueBB);
+  BuildMI(LoopBB, DL, TII->get(Moe::SRL), MultiplierNext).addReg(MultiplierPhi);
+  BuildMI(LoopBB, DL, TII->get(Moe::JCC))
+      .addMBB(ContinueBB)
+      .addImm(MoeCC::COND_CC);
+
+  // AddBB
+  BuildMI(AddBB, DL, TII->get(Moe::ADD), ResultAdded)
+      .addReg(ResultPhi)
+      .addReg(MultiplicandPhi);
+
+  // ContinueBB
+  BuildMI(*ContinueBB, ContinueBB->begin(), DL, TII->get(TargetOpcode::PHI),
+          ResultNext)
+      .addReg(ResultPhi).addMBB(LoopBB)
+      .addReg(ResultAdded).addMBB(AddBB);
+  BuildMI(ContinueBB, DL, TII->get(Moe::SHL), MultiplicandNext)
+      .addReg(MultiplicandPhi);
+  BuildMI(ContinueBB, DL, TII->get(Moe::INCREMENT), CounterNext)
+      .addReg(CounterPhi)
+      .addImm(1);
+  BuildMI(ContinueBB, DL, TII->get(Moe::SUBcmp))
+      .addReg(CounterNext)
+      .addReg(Bound);
+  BuildMI(ContinueBB, DL, TII->get(Moe::JCC))
+      .addMBB(LoopBB)
+      .addImm(MoeCC::COND_NE);
+
+  // ExitBB: ContinueBB is ExitBB's only predecessor, so a plain COPY
+  // suffices - no PHI needed for a single incoming value.
+  BuildMI(*ExitBB, ExitBB->begin(), DL, TII->get(TargetOpcode::COPY), DstReg)
+      .addReg(ResultNext);
+
+  MI.eraseFromParent();
+  return ExitBB;
+}
+
+//===----------------------------------------------------------------------===//
+// Software unsigned divide/remainder - restoring binary long division. Each
+// iteration shifts the dividend left by one bit while simultaneously
+// shifting that bit into the remainder from the bottom, via SHIFT's Carry-in
+// chaining (SHLc - see the spec's SHIFT section on how Carry in feeds a
+// shifted-out bit from one SHIFT into the next, the same mechanic a
+// multi-word shift chain uses): SHL on the dividend produces C = its old
+// MSB, and the immediately-following SHLc on the remainder consumes that
+// same C as its shifted-in LSB.
+//
+// Blocks (BB is DIVMODPSEUDO's parent block, split at the pseudo):
+//   BB:         dividend/divisor copies; remainder/quotient/counter/bound
+//               seeded via self-XOR/INCREMENT (see emitMul's BB for the
+//               same trick). Falls through to LoopBB.
+//   LoopBB:     shift dividend left by 1 (C = old MSB); chain-shift
+//               remainder left by 1, pulling that bit in (SHLc); compare
+//               the shifted remainder against the divisor (SUBcmp - C=1
+//               means no borrow, i.e. remainder >= divisor, see the spec's
+//               SUB flags note); branch to SubBB if so, else fall through
+//               to NoSubBB.
+//   NoSubBB:    quotient bit is 0 this iteration (plain SHL, fills 0);
+//               explicit jump to ContinueBB (not layout-adjacent).
+//   SubBB:      remainder -= divisor; quotient bit is 1 this iteration
+//               (SHL then INCREMENT +1); falls through to ContinueBB.
+//   ContinueBB: merges remainder and quotient (PHI: NoSubBB's unchanged/
+//               0-filled values, or SubBB's subtracted/1-filled values);
+//               increments counter; compares against bound (32); loops back
+//               to LoopBB while not equal, else falls through to ExitBB.
+//   ExitBB:     receives DIVMODPSEUDO's original successors; copies the
+//               final quotient/remainder into the pseudo's original
+//               destination registers.
+//
+// As in emitMul, every flag-consuming branch/chain-shift immediately
+// follows the instruction that set the flags it needs, so ADD/SUB/SHIFT/
+// INCREMENT's shared clobbering of S/Z/C/O never needs a preservation
+// trick.
+//===----------------------------------------------------------------------===//
+
+MachineBasicBlock *MoeTargetLowering::emitDivRem(MachineInstr &MI,
+                                                  MachineBasicBlock *BB) const {
+  const TargetInstrInfo *TII = BB->getParent()->getSubtarget().getInstrInfo();
+  DebugLoc DL = MI.getDebugLoc();
+  MachineFunction *MF = BB->getParent();
+  MachineRegisterInfo &MRI = MF->getRegInfo();
+  const TargetRegisterClass *RC = &Moe::GPRRegClass;
+
+  Register QuotientDst = MI.getOperand(0).getReg();
+  Register RemainderDst = MI.getOperand(1).getReg();
+  Register AReg = MI.getOperand(2).getReg();
+  Register BReg = MI.getOperand(3).getReg();
+
+  const BasicBlock *LLVM_BB = BB->getBasicBlock();
+  MachineFunction::iterator InsertPt = ++BB->getIterator();
+  MachineBasicBlock *LoopBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *NoSubBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *SubBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *ContinueBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *ExitBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MF->insert(InsertPt, LoopBB);
+  MF->insert(InsertPt, NoSubBB);
+  MF->insert(InsertPt, SubBB);
+  MF->insert(InsertPt, ContinueBB);
+  MF->insert(InsertPt, ExitBB);
+
+  ExitBB->splice(ExitBB->begin(), BB,
+                 std::next(MachineBasicBlock::iterator(MI)), BB->end());
+  ExitBB->transferSuccessorsAndUpdatePHIs(BB);
+
+  BB->addSuccessor(LoopBB);
+  LoopBB->addSuccessor(SubBB);      // carry set (remainder >= divisor): subtract
+  LoopBB->addSuccessor(NoSubBB);    // carry clear: no subtract
+  NoSubBB->addSuccessor(ContinueBB);
+  SubBB->addSuccessor(ContinueBB);
+  ContinueBB->addSuccessor(LoopBB); // counter != bound: loop back
+  ContinueBB->addSuccessor(ExitBB); // counter == bound: done
+
+  Register Dividend0 = MRI.createVirtualRegister(RC);
+  Register Divisor0 = MRI.createVirtualRegister(RC);
+  Register Remainder0 = MRI.createVirtualRegister(RC);
+  Register Quotient0 = MRI.createVirtualRegister(RC);
+  Register Counter0 = MRI.createVirtualRegister(RC);
+  Register Bound = MRI.createVirtualRegister(RC);
+
+  Register DividendPhi = MRI.createVirtualRegister(RC);
+  Register RemainderPhi = MRI.createVirtualRegister(RC);
+  Register QuotientPhi = MRI.createVirtualRegister(RC);
+  Register CounterPhi = MRI.createVirtualRegister(RC);
+  Register DividendNext = MRI.createVirtualRegister(RC);
+  Register RemainderShifted = MRI.createVirtualRegister(RC);
+  Register QuotientNoSub = MRI.createVirtualRegister(RC);
+  Register RemainderSub = MRI.createVirtualRegister(RC);
+  Register QuotientSubTmp = MRI.createVirtualRegister(RC);
+  Register QuotientSub = MRI.createVirtualRegister(RC);
+  Register RemainderNext = MRI.createVirtualRegister(RC);
+  Register QuotientNext = MRI.createVirtualRegister(RC);
+  Register CounterNext = MRI.createVirtualRegister(RC);
+  Register BoundZero = MRI.createVirtualRegister(RC);
+
+  // BB
+  BuildMI(*BB, MI, DL, TII->get(TargetOpcode::COPY), Dividend0).addReg(AReg);
+  BuildMI(*BB, MI, DL, TII->get(TargetOpcode::COPY), Divisor0).addReg(BReg);
+  BuildMI(*BB, MI, DL, TII->get(Moe::XOR), Remainder0)
+      .addReg(Dividend0)
+      .addReg(Dividend0);
+  BuildMI(*BB, MI, DL, TII->get(Moe::XOR), Quotient0)
+      .addReg(Dividend0)
+      .addReg(Dividend0);
+  BuildMI(*BB, MI, DL, TII->get(Moe::XOR), Counter0)
+      .addReg(Dividend0)
+      .addReg(Dividend0);
+  // Bound = 32: see emitMul's BoundZero comment - INCREMENT's tied "$o =
+  // $oin" needs a fresh destination register distinct from its zeroed seed.
+  BuildMI(*BB, MI, DL, TII->get(Moe::XOR), BoundZero)
+      .addReg(Dividend0)
+      .addReg(Dividend0);
+  BuildMI(*BB, MI, DL, TII->get(Moe::INCREMENT), Bound)
+      .addReg(BoundZero)
+      .addImm(32);
+
+  // LoopBB
+  BuildMI(LoopBB, DL, TII->get(TargetOpcode::PHI), DividendPhi)
+      .addReg(Dividend0).addMBB(BB)
+      .addReg(DividendNext).addMBB(ContinueBB);
+  BuildMI(LoopBB, DL, TII->get(TargetOpcode::PHI), RemainderPhi)
+      .addReg(Remainder0).addMBB(BB)
+      .addReg(RemainderNext).addMBB(ContinueBB);
+  BuildMI(LoopBB, DL, TII->get(TargetOpcode::PHI), QuotientPhi)
+      .addReg(Quotient0).addMBB(BB)
+      .addReg(QuotientNext).addMBB(ContinueBB);
+  BuildMI(LoopBB, DL, TII->get(TargetOpcode::PHI), CounterPhi)
+      .addReg(Counter0).addMBB(BB)
+      .addReg(CounterNext).addMBB(ContinueBB);
+  BuildMI(LoopBB, DL, TII->get(Moe::SHL), DividendNext).addReg(DividendPhi);
+  BuildMI(LoopBB, DL, TII->get(Moe::SHLc), RemainderShifted)
+      .addReg(RemainderPhi);
+  BuildMI(LoopBB, DL, TII->get(Moe::SUBcmp))
+      .addReg(RemainderShifted)
+      .addReg(Divisor0);
+  BuildMI(LoopBB, DL, TII->get(Moe::JCC)).addMBB(SubBB).addImm(MoeCC::COND_CS);
+
+  // NoSubBB: remainder unchanged (RemainderShifted), quotient bit 0.
+  BuildMI(NoSubBB, DL, TII->get(Moe::SHL), QuotientNoSub).addReg(QuotientPhi);
+  BuildMI(NoSubBB, DL, TII->get(Moe::JMP)).addMBB(ContinueBB);
+
+  // SubBB: remainder -= divisor, quotient bit 1.
+  BuildMI(SubBB, DL, TII->get(Moe::SUB), RemainderSub)
+      .addReg(RemainderShifted)
+      .addReg(Divisor0);
+  BuildMI(SubBB, DL, TII->get(Moe::SHL), QuotientSubTmp).addReg(QuotientPhi);
+  BuildMI(SubBB, DL, TII->get(Moe::INCREMENT), QuotientSub)
+      .addReg(QuotientSubTmp)
+      .addImm(1);
+
+  // ContinueBB
+  BuildMI(*ContinueBB, ContinueBB->begin(), DL, TII->get(TargetOpcode::PHI),
+          RemainderNext)
+      .addReg(RemainderShifted).addMBB(NoSubBB)
+      .addReg(RemainderSub).addMBB(SubBB);
+  BuildMI(*ContinueBB, ContinueBB->begin(), DL, TII->get(TargetOpcode::PHI),
+          QuotientNext)
+      .addReg(QuotientNoSub).addMBB(NoSubBB)
+      .addReg(QuotientSub).addMBB(SubBB);
+  BuildMI(ContinueBB, DL, TII->get(Moe::INCREMENT), CounterNext)
+      .addReg(CounterPhi)
+      .addImm(1);
+  BuildMI(ContinueBB, DL, TII->get(Moe::SUBcmp))
+      .addReg(CounterNext)
+      .addReg(Bound);
+  BuildMI(ContinueBB, DL, TII->get(Moe::JCC))
+      .addMBB(LoopBB)
+      .addImm(MoeCC::COND_NE);
+
+  // ExitBB: ContinueBB is ExitBB's only predecessor, so plain COPYs suffice.
+  BuildMI(*ExitBB, ExitBB->begin(), DL, TII->get(TargetOpcode::COPY),
+          RemainderDst)
+      .addReg(RemainderNext);
+  BuildMI(*ExitBB, ExitBB->begin(), DL, TII->get(TargetOpcode::COPY),
+          QuotientDst)
+      .addReg(QuotientNext);
+
+  MI.eraseFromParent();
+  return ExitBB;
+}
+
+//===----------------------------------------------------------------------===//
+// Conditional negate - tests TestReg's sign (SUBcmp against a caller-
+// supplied zero register; S=1 iff TestReg < 0, see the spec's Flags
+// section) and conditionally negates ValueReg (0 - ValueReg, via the same
+// zero-register trick emitMul/emitDivRem use to materialize 0 - there's no
+// dedicated NEGATE instruction). TestReg and ValueReg may be the same
+// register (an absolute-value use) or different (e.g. testing one value's
+// sign to decide whether to negate a different one) - see emitSDivRem's
+// uses of both shapes. Same skip-the-work/fall-through-does-the-work/merge
+// shape as emitMul's LoopBB/AddBB/ContinueBB: *BB is updated to the merge
+// block where the result is available and the caller should continue
+// appending code (this never creates a distinct "exit" block of its own -
+// the caller keeps building directly in the returned block).
+//===----------------------------------------------------------------------===//
+
+Register MoeTargetLowering::emitCondNegate(MachineFunction *MF,
+                                            MachineRegisterInfo &MRI,
+                                            const TargetInstrInfo *TII,
+                                            const DebugLoc &DL,
+                                            MachineBasicBlock *&BB,
+                                            Register ZeroReg, Register TestReg,
+                                            Register ValueReg) const {
+  const TargetRegisterClass *RC = &Moe::GPRRegClass;
+  MachineBasicBlock *CurBB = BB;
+  const BasicBlock *LLVM_BB = CurBB->getBasicBlock();
+  MachineFunction::iterator InsertPt = ++CurBB->getIterator();
+  MachineBasicBlock *NegBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *MergeBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MF->insert(InsertPt, NegBB);
+  MF->insert(InsertPt, MergeBB);
+
+  CurBB->addSuccessor(MergeBB); // positive/zero: skip negation
+  CurBB->addSuccessor(NegBB);   // negative: fall through and negate
+
+  Register Negated = MRI.createVirtualRegister(RC);
+  Register Result = MRI.createVirtualRegister(RC);
+
+  BuildMI(CurBB, DL, TII->get(Moe::SUBcmp)).addReg(TestReg).addReg(ZeroReg);
+  BuildMI(CurBB, DL, TII->get(Moe::JCC)).addMBB(MergeBB).addImm(MoeCC::COND_PL);
+
+  BuildMI(NegBB, DL, TII->get(Moe::SUB), Negated)
+      .addReg(ZeroReg)
+      .addReg(ValueReg);
+  NegBB->addSuccessor(MergeBB);
+
+  BuildMI(*MergeBB, MergeBB->begin(), DL, TII->get(TargetOpcode::PHI), Result)
+      .addReg(ValueReg).addMBB(CurBB)
+      .addReg(Negated).addMBB(NegBB);
+
+  BB = MergeBB;
+  return Result;
+}
+
+//===----------------------------------------------------------------------===//
+// Software signed divide/remainder - wraps the same restoring-division loop
+// emitDivRem uses (duplicated here rather than shared, so emitDivRem's
+// already-verified block wiring stays untouched by this function) with
+// sign correction: absolute-value both operands via emitCondNegate, run the
+// unsigned loop, then negate the quotient if the operands' original signs
+// differed and the remainder if the dividend was negative (C-style
+// truncating-toward-zero division - the remainder takes the dividend's
+// sign). AReg XOR BReg's sign bit equals AReg's-sign XOR BReg's-sign, so no
+// separate boolean sign tracking is needed for the quotient correction -
+// see the Milestone 3 plan's "Software divide/remainder" section.
+//===----------------------------------------------------------------------===//
+
+MachineBasicBlock *MoeTargetLowering::emitSDivRem(MachineInstr &MI,
+                                                   MachineBasicBlock *BB) const {
+  const TargetInstrInfo *TII = BB->getParent()->getSubtarget().getInstrInfo();
+  DebugLoc DL = MI.getDebugLoc();
+  MachineFunction *MF = BB->getParent();
+  MachineRegisterInfo &MRI = MF->getRegInfo();
+  const TargetRegisterClass *RC = &Moe::GPRRegClass;
+
+  Register QuotientDst = MI.getOperand(0).getReg();
+  Register RemainderDst = MI.getOperand(1).getReg();
+  Register AReg = MI.getOperand(2).getReg();
+  Register BReg = MI.getOperand(3).getReg();
+
+  MachineBasicBlock *EntryBB = BB;
+
+  // Detach whatever originally followed MI (e.g. the lowered `ret`'s own
+  // COPY+RET) into an unlinked scratch block immediately, before any other
+  // block-building below. Until this happens, EntryBB->end() still means
+  // "after that original tail," not "after our own code" - every other
+  // BuildMI call in this function (and in emitCondNegate) that appends via
+  // a bare MachineBasicBlock* (rather than an explicit "insert before X"
+  // iterator) would otherwise land after that stale tail instead of where
+  // intended, only to get swept along by the final splice below into the
+  // real exit block in the wrong position (past its own RET) - this was a
+  // real bug, caught by -verify-machineinstrs, see the Milestone 3 plan.
+  // TailScratch is deliberately never inserted into MF's block list here;
+  // its content is spliced into the real ExitBB at the very end.
+  MachineBasicBlock *TailScratch =
+      MF->CreateMachineBasicBlock(EntryBB->getBasicBlock());
+  TailScratch->splice(TailScratch->begin(), EntryBB,
+                       std::next(MachineBasicBlock::iterator(MI)),
+                       EntryBB->end());
+  TailScratch->transferSuccessorsAndUpdatePHIs(EntryBB);
+
+  Register ZeroReg = MRI.createVirtualRegister(RC);
+  Register SignXor = MRI.createVirtualRegister(RC);
+  BuildMI(*EntryBB, MI, DL, TII->get(Moe::XOR), ZeroReg)
+      .addReg(AReg)
+      .addReg(AReg);
+  BuildMI(*EntryBB, MI, DL, TII->get(Moe::XOR), SignXor)
+      .addReg(AReg)
+      .addReg(BReg);
+
+  MachineBasicBlock *CurBB = EntryBB;
+  Register AbsA = emitCondNegate(MF, MRI, TII, DL, CurBB, ZeroReg, AReg, AReg);
+  Register AbsB = emitCondNegate(MF, MRI, TII, DL, CurBB, ZeroReg, BReg, BReg);
+
+  // Unsigned restoring-division loop on the absolute values - same shape as
+  // emitDivRem's LoopBB/NoSubBB/SubBB/ContinueBB (see that function for the
+  // per-instruction rationale).
+  const BasicBlock *LLVM_BB = CurBB->getBasicBlock();
+  MachineFunction::iterator InsertPt = ++CurBB->getIterator();
+  MachineBasicBlock *LoopBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *NoSubBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *SubBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *ContinueBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *LoopExitBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MF->insert(InsertPt, LoopBB);
+  MF->insert(InsertPt, NoSubBB);
+  MF->insert(InsertPt, SubBB);
+  MF->insert(InsertPt, ContinueBB);
+  MF->insert(InsertPt, LoopExitBB);
+
+  CurBB->addSuccessor(LoopBB);
+  LoopBB->addSuccessor(SubBB);
+  LoopBB->addSuccessor(NoSubBB);
+  NoSubBB->addSuccessor(ContinueBB);
+  SubBB->addSuccessor(ContinueBB);
+  ContinueBB->addSuccessor(LoopBB);
+  ContinueBB->addSuccessor(LoopExitBB);
+
+  Register Remainder0 = MRI.createVirtualRegister(RC);
+  Register Quotient0 = MRI.createVirtualRegister(RC);
+  Register Counter0 = MRI.createVirtualRegister(RC);
+  Register Bound = MRI.createVirtualRegister(RC);
+
+  Register DividendPhi = MRI.createVirtualRegister(RC);
+  Register RemainderPhi = MRI.createVirtualRegister(RC);
+  Register QuotientPhi = MRI.createVirtualRegister(RC);
+  Register CounterPhi = MRI.createVirtualRegister(RC);
+  Register DividendNext = MRI.createVirtualRegister(RC);
+  Register RemainderShifted = MRI.createVirtualRegister(RC);
+  Register QuotientNoSub = MRI.createVirtualRegister(RC);
+  Register RemainderSub = MRI.createVirtualRegister(RC);
+  Register QuotientSubTmp = MRI.createVirtualRegister(RC);
+  Register QuotientSub = MRI.createVirtualRegister(RC);
+  Register RemainderNext = MRI.createVirtualRegister(RC);
+  Register QuotientNext = MRI.createVirtualRegister(RC);
+  Register CounterNext = MRI.createVirtualRegister(RC);
+  Register UQuotient = MRI.createVirtualRegister(RC);
+  Register URemainder = MRI.createVirtualRegister(RC);
+  Register BoundZero = MRI.createVirtualRegister(RC);
+
+  BuildMI(CurBB, DL, TII->get(Moe::XOR), Remainder0).addReg(AbsA).addReg(AbsA);
+  BuildMI(CurBB, DL, TII->get(Moe::XOR), Quotient0).addReg(AbsA).addReg(AbsA);
+  BuildMI(CurBB, DL, TII->get(Moe::XOR), Counter0).addReg(AbsA).addReg(AbsA);
+  // Bound = 32: see emitMul's BoundZero comment - INCREMENT's tied "$o =
+  // $oin" needs a fresh destination register distinct from its zeroed seed.
+  BuildMI(CurBB, DL, TII->get(Moe::XOR), BoundZero).addReg(AbsA).addReg(AbsA);
+  BuildMI(CurBB, DL, TII->get(Moe::INCREMENT), Bound)
+      .addReg(BoundZero)
+      .addImm(32);
+
+  BuildMI(LoopBB, DL, TII->get(TargetOpcode::PHI), DividendPhi)
+      .addReg(AbsA).addMBB(CurBB)
+      .addReg(DividendNext).addMBB(ContinueBB);
+  BuildMI(LoopBB, DL, TII->get(TargetOpcode::PHI), RemainderPhi)
+      .addReg(Remainder0).addMBB(CurBB)
+      .addReg(RemainderNext).addMBB(ContinueBB);
+  BuildMI(LoopBB, DL, TII->get(TargetOpcode::PHI), QuotientPhi)
+      .addReg(Quotient0).addMBB(CurBB)
+      .addReg(QuotientNext).addMBB(ContinueBB);
+  BuildMI(LoopBB, DL, TII->get(TargetOpcode::PHI), CounterPhi)
+      .addReg(Counter0).addMBB(CurBB)
+      .addReg(CounterNext).addMBB(ContinueBB);
+  BuildMI(LoopBB, DL, TII->get(Moe::SHL), DividendNext).addReg(DividendPhi);
+  BuildMI(LoopBB, DL, TII->get(Moe::SHLc), RemainderShifted)
+      .addReg(RemainderPhi);
+  BuildMI(LoopBB, DL, TII->get(Moe::SUBcmp))
+      .addReg(RemainderShifted)
+      .addReg(AbsB);
+  BuildMI(LoopBB, DL, TII->get(Moe::JCC)).addMBB(SubBB).addImm(MoeCC::COND_CS);
+
+  BuildMI(NoSubBB, DL, TII->get(Moe::SHL), QuotientNoSub).addReg(QuotientPhi);
+  BuildMI(NoSubBB, DL, TII->get(Moe::JMP)).addMBB(ContinueBB);
+
+  BuildMI(SubBB, DL, TII->get(Moe::SUB), RemainderSub)
+      .addReg(RemainderShifted)
+      .addReg(AbsB);
+  BuildMI(SubBB, DL, TII->get(Moe::SHL), QuotientSubTmp).addReg(QuotientPhi);
+  BuildMI(SubBB, DL, TII->get(Moe::INCREMENT), QuotientSub)
+      .addReg(QuotientSubTmp)
+      .addImm(1);
+
+  BuildMI(*ContinueBB, ContinueBB->begin(), DL, TII->get(TargetOpcode::PHI),
+          RemainderNext)
+      .addReg(RemainderShifted).addMBB(NoSubBB)
+      .addReg(RemainderSub).addMBB(SubBB);
+  BuildMI(*ContinueBB, ContinueBB->begin(), DL, TII->get(TargetOpcode::PHI),
+          QuotientNext)
+      .addReg(QuotientNoSub).addMBB(NoSubBB)
+      .addReg(QuotientSub).addMBB(SubBB);
+  BuildMI(ContinueBB, DL, TII->get(Moe::INCREMENT), CounterNext)
+      .addReg(CounterPhi)
+      .addImm(1);
+  BuildMI(ContinueBB, DL, TII->get(Moe::SUBcmp))
+      .addReg(CounterNext)
+      .addReg(Bound);
+  BuildMI(ContinueBB, DL, TII->get(Moe::JCC))
+      .addMBB(LoopBB)
+      .addImm(MoeCC::COND_NE);
+
+  // UQuotient/URemainder are exactly ContinueBB's final QuotientNext/
+  // RemainderNext, valid at LoopExitBB (its only predecessor) with no PHI
+  // needed - a plain COPY makes them available under stable names for the
+  // sign-correction step below.
+  BuildMI(*LoopExitBB, LoopExitBB->begin(), DL, TII->get(TargetOpcode::COPY),
+          URemainder)
+      .addReg(RemainderNext);
+  BuildMI(*LoopExitBB, LoopExitBB->begin(), DL, TII->get(TargetOpcode::COPY),
+          UQuotient)
+      .addReg(QuotientNext);
+
+  CurBB = LoopExitBB;
+  Register FinalQuotient =
+      emitCondNegate(MF, MRI, TII, DL, CurBB, ZeroReg, SignXor, UQuotient);
+  Register FinalRemainder =
+      emitCondNegate(MF, MRI, TII, DL, CurBB, ZeroReg, AReg, URemainder);
+
+  // ExitBB already holds one PHI (FinalRemainder's, from the last
+  // emitCondNegate call) - unlike emitMul/emitDivRem's fresh ExitBB, the
+  // final copies must be appended *after* that PHI, and the original tail
+  // spliced in after those copies (not at begin(), which would land before
+  // the PHI and violate "PHIs must lead the block").
+  MachineBasicBlock *ExitBB = CurBB;
+  BuildMI(*ExitBB, ExitBB->end(), DL, TII->get(TargetOpcode::COPY),
+          RemainderDst)
+      .addReg(FinalRemainder);
+  BuildMI(*ExitBB, ExitBB->end(), DL, TII->get(TargetOpcode::COPY),
+          QuotientDst)
+      .addReg(FinalQuotient);
+
+  ExitBB->splice(ExitBB->end(), TailScratch, TailScratch->begin(),
+                 TailScratch->end());
+  ExitBB->transferSuccessorsAndUpdatePHIs(TailScratch);
+
+  MI.eraseFromParent();
+  return ExitBB;
 }

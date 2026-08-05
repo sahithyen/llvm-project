@@ -117,6 +117,41 @@ def CALL : MoePseudo<(outs), (ins calltarget:$callee), "#CALL $callee",
 let isReturn = 1, isTerminator = 1, isBarrier = 1, Uses = [SP], Defs = [SP] in
 def RET : MoePseudo<(outs), (ins), "#RET", [(Moeret)]>;
 
+// Software multiply (see the Milestone 3 plan's "Software multiply" section):
+// SHIFT moves exactly one bit per instruction and its carry-out is the bit
+// shifted out, so a shift-and-add loop can test each multiplier bit directly
+// off SHIFT's C flag, with no AND-with-1 masking step (AND is register-
+// register only anyway, so there's no immediate-mask instruction to use).
+// Expanded by MoeTargetLowering::emitMul into a real runtime loop of SHIFT/
+// ADD/INCREMENT/JCC - constructed directly as a machine node in LowerMUL
+// (not matched via a SelectionDAG Pat), so no pattern is needed here.
+let usesCustomInserter = 1 in
+def MULPSEUDO : MoePseudo<(outs GPR:$dst), (ins GPR:$a, GPR:$b),
+                           "#MUL $dst, $a, $b", []>;
+
+// Software unsigned divide/remainder (see the Milestone 3 plan's "Software
+// divide/remainder" section): a restoring binary long-division loop,
+// producing quotient and remainder together so UDIV/UREM of the same
+// operands share one loop. Each iteration shifts the dividend and remainder
+// together as one wide value via SHIFT's Carry-in chaining (SHLc, already
+// defined below - the same mechanic 'SHIFT' in the Instruction set chapter
+// describes for multi-word shifts), then compares the shifted remainder
+// against the divisor to decide the next quotient bit. Constructed directly
+// as a machine node in LowerUDIV/LowerUREM (not matched via a SelectionDAG
+// Pat), so no pattern is needed here.
+let usesCustomInserter = 1 in
+def DIVMODPSEUDO : MoePseudo<(outs GPR:$q, GPR:$r), (ins GPR:$a, GPR:$b),
+                              "#DIVMOD $q, $r, $a, $b", []>;
+
+// Software signed divide/remainder: wraps DIVMODPSEUDO's unsigned core with
+// sign correction (see the Milestone 3 plan's "Software divide/remainder"
+// section) - absolute-value the operands, run the same unsigned loop, then
+// negate the quotient if the operands' signs differed and the remainder if
+// the dividend was negative (C-style truncating-toward-zero division).
+let usesCustomInserter = 1 in
+def SDIVMODPSEUDO : MoePseudo<(outs GPR:$q, GPR:$r), (ins GPR:$a, GPR:$b),
+                               "#SDIVMOD $q, $r, $a, $b", []>;
+
 //===----------------------------------------------------------------------===//
 // MOVE (0b0100) - the only register-to-register copy; also how a computed
 // value redirects control flow (MOVE ... -> IA), used by RET's expansion.
@@ -152,8 +187,14 @@ def SUB : AddSubForm<0b1010, (outs GPR:$o), (ins GPR:$a, GPR:$b),
 // (unlike AND/OR/XOR/SHIFT, SUB has no Test-mode result-discard bit) - since
 // this pseudo's result is never used, `o` is just hardcoded to GP0 (0),
 // mirroring Test mode's own "O must be encoded as 0" convention for a
-// discarded result.
-let isCompare = 1, o = 0 in
+// discarded result. Real hardware still physically writes that dead result
+// into GP0 (register encoding 0) every time - Defs = [GP0] tells the
+// register allocator this instruction clobbers GP0 even though this
+// pseudo's own (outs) list is empty, so nothing else is kept live there
+// across a SUBcmp (see the Milestone 3 plan: this surfaced as a real bug -
+// the software-multiply loop's counter got silently allocated to GP0 and
+// destroyed by its own loop-condition SUBcmp before this fix).
+let isCompare = 1, o = 0, Defs = [GP0] in
 def SUBcmp : AddSubForm<0b1010, (outs), (ins GPR:$a, GPR:$b),
                          "sub $a, $b -> (dead)", [(Moecmp GPR:$a, GPR:$b)]>;
 

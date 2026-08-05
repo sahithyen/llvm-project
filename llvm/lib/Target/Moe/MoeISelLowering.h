@@ -46,6 +46,11 @@ public:
   SDValue LowerGlobalAddress(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerConstantPool(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerBR_CC(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerMUL(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerUDIV(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerUREM(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerSDIV(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerSREM(SDValue Op, SelectionDAG &DAG) const;
 
   MachineBasicBlock *
   EmitInstrWithCustomInserter(MachineInstr &MI,
@@ -78,6 +83,13 @@ private:
                       SelectionDAG &DAG) const override;
 
   MachineBasicBlock *emitCall(MachineInstr &MI, MachineBasicBlock *BB) const;
+  MachineBasicBlock *emitMul(MachineInstr &MI, MachineBasicBlock *BB) const;
+  MachineBasicBlock *emitDivRem(MachineInstr &MI, MachineBasicBlock *BB) const;
+  MachineBasicBlock *emitSDivRem(MachineInstr &MI, MachineBasicBlock *BB) const;
+  Register emitCondNegate(MachineFunction *MF, MachineRegisterInfo &MRI,
+                          const TargetInstrInfo *TII, const DebugLoc &DL,
+                          MachineBasicBlock *&BB, Register ZeroReg,
+                          Register TestReg, Register ValueReg) const;
 };
 
 } // namespace llvm
