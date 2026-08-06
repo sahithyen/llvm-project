@@ -673,8 +673,10 @@ MachineBasicBlock *MoeTargetLowering::emitCall(MachineInstr &MI,
   // code for exactly the same reason as the original bug, only caught by
   // actually executing a 3-call chain where the result has to survive to a
   // later call - see sdiv_test.ll and the Milestone 4 plan). GP0's live-in
-  // below does trip MachineVerifier's "allocatable live-in but isn't entry/
-  // landing-pad" check while still in SSA form (pre-PHI-elimination) - that
+  // below (added when the call's result is actually consumed - see the
+  // Milestone 7 plan's addition of that condition) does trip
+  // MachineVerifier's "allocatable live-in but isn't entry/landing-pad"
+  // check while still in SSA form (pre-PHI-elimination) - that
   // check is gated off once the function leaves SSA form
   // (MF->getProperties().hasNoPHIs(), see MachineVerifier.cpp), and no
   // later pass in this pipeline (phi-elimination, two-address, RegAllocFast
@@ -689,7 +691,33 @@ MachineBasicBlock *MoeTargetLowering::emitCall(MachineInstr &MI,
                       std::next(MachineBasicBlock::iterator(MI)), BB->end());
   ContinueBB->transferSuccessorsAndUpdatePHIs(BB);
   BB->addSuccessor(ContinueBB);
-  ContinueBB->addLiveIn(Moe::GP0);
+
+  // Only declare GP0 live-in here if this call's return value is actually
+  // consumed - i.e. ContinueBB (just spliced in above) contains
+  // LowerCallResult's `COPY $gp0` reading it. A call whose LLVM-level
+  // return type is void, or was demoted to a hidden sret pointer (see the
+  // Milestone 7 plan's multi-field-struct-return finding), has no such
+  // COPY - and unconditionally marking GP0 live-in regardless (this
+  // function's original Milestone 4 behavior) collides with
+  // RegAllocFast::reloadAtBegin: it treats *any* physical register a block
+  // declares live-in as already holding a valid value, silently skipping
+  // the reload of any OTHER virtual register that also happens to have
+  // been allocated that exact physical register before the call - e.g.
+  // FIADDR's hidden-return-pointer result, when it's passed as this call's
+  // own first argument in GP0 and is also needed again afterward. This was
+  // discovered via a real, reproducible wrong-answer bug (not a crash),
+  // not a hypothetical - see struct_abi_test.ll's excluded multi-field-
+  // struct-return case before this fix.
+  bool ReturnValueConsumed = false;
+  for (MachineInstr &Later : *ContinueBB) {
+    if (Later.isCopy() && Later.getOperand(1).isReg() &&
+        Later.getOperand(1).getReg() == Moe::GP0) {
+      ReturnValueConsumed = true;
+      break;
+    }
+  }
+  if (ReturnValueConsumed)
+    ContinueBB->addLiveIn(Moe::GP0);
 
   // ContinueBB has exactly one predecessor (BB) and is reached purely by
   // fallthrough from the AsmPrinter's point of view (JMPabs is deliberately
