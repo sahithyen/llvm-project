@@ -59,7 +59,7 @@ void MoeInstrInfo::copyPhysReg(MachineBasicBlock &MBB,
                                 const DebugLoc &DL, Register DestReg,
                                 Register SrcReg, bool KillSrc,
                                 bool RenamableDest, bool RenamableSrc) const {
-  assert(Moe::GPRRegClass.contains(DestReg, SrcReg) &&
+  assert(Moe::AllRegRegClass.contains(DestReg, SrcReg) &&
          "Impossible reg-to-reg copy");
   BuildMI(MBB, I, DL, get(Moe::MOVE), DestReg)
       .addReg(SrcReg, getKillRegState(KillSrc));
