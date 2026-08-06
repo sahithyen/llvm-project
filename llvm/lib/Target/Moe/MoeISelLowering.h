@@ -51,6 +51,7 @@ public:
   SDValue LowerUREM(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerSDIV(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerSREM(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerExtLoad(SDValue Op, SelectionDAG &DAG) const;
 
   MachineBasicBlock *
   EmitInstrWithCustomInserter(MachineInstr &MI,
@@ -86,6 +87,7 @@ private:
   MachineBasicBlock *emitMul(MachineInstr &MI, MachineBasicBlock *BB) const;
   MachineBasicBlock *emitDivRem(MachineInstr &MI, MachineBasicBlock *BB) const;
   MachineBasicBlock *emitSDivRem(MachineInstr &MI, MachineBasicBlock *BB) const;
+  MachineBasicBlock *emitVarShift(MachineInstr &MI, MachineBasicBlock *BB) const;
   Register emitCondNegate(MachineFunction *MF, MachineRegisterInfo &MRI,
                           const TargetInstrInfo *TII, const DebugLoc &DL,
                           MachineBasicBlock *&BB, Register ZeroReg,

@@ -79,6 +79,31 @@ MoeTargetLowering::MoeTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::DYNAMIC_STACKALLOC, MVT::i32, Expand);
   setOperationAction(ISD::STACKSAVE, MVT::Other, Expand);
   setOperationAction(ISD::STACKRESTORE, MVT::Other, Expand);
+
+  // A Byte/Halfword-size LOAD only overwrites the selected lane of its
+  // destination register - the rest keeps its prior value (see 'Handling
+  // words, halfwords and bytes' in the Encoding chapter) - unlike most RISC
+  // ISAs' natively-extending loads. So a zext/sext load needs a real
+  // multi-instruction sequence (LowerExtLoad), not a single Pat-matched
+  // instruction - see LOADrr_B/LOADrr_H's comment in MoeInstrInfo.td.
+  // EXTLOAD (undefined upper bits) is treated identically to ZEXTLOAD: safe,
+  // since "undefined" permits any value, and reuses the same sequence.
+  for (MVT MemVT : {MVT::i8, MVT::i16}) {
+    setLoadExtAction(ISD::ZEXTLOAD, MVT::i32, MemVT, Custom);
+    setLoadExtAction(ISD::SEXTLOAD, MVT::i32, MemVT, Custom);
+    setLoadExtAction(ISD::EXTLOAD, MVT::i32, MemVT, Custom);
+  }
+
+  // DAGCombiner can reuse an existing zextload's value for a sextload of
+  // the same address (rather than emitting a second load) by wrapping it in
+  // a SIGN_EXTEND_INREG - a distinct ISD opcode from the LOAD node
+  // LowerExtLoad handles above, and one this target has never needed until
+  // now. Expand is the standard generic lowering (shift left then
+  // arithmetic-shift-right by the same amount) and, since SHL/SRA are
+  // already Custom-lowered via LowerShifts's constant-amount chain above,
+  // this reuses that existing, already-working machinery for free.
+  setOperationAction(ISD::SIGN_EXTEND_INREG, MVT::i8, Expand);
+  setOperationAction(ISD::SIGN_EXTEND_INREG, MVT::i16, Expand);
 }
 
 //===----------------------------------------------------------------------===//
@@ -108,6 +133,8 @@ SDValue MoeTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
     return LowerSDIV(Op, DAG);
   case ISD::SREM:
     return LowerSREM(Op, DAG);
+  case ISD::LOAD:
+    return LowerExtLoad(Op, DAG);
   default:
     llvm_unreachable("unimplemented operand");
   }
@@ -186,31 +213,120 @@ SDValue MoeTargetLowering::LowerShifts(SDValue Op, SelectionDAG &DAG) const {
   EVT VT = Op.getValueType();
   SDLoc dl(N);
 
-  auto *Amt = dyn_cast<ConstantSDNode>(N->getOperand(1));
-  if (!Amt)
-    report_fatal_error(
-        "Moe: variable-amount shifts are not yet supported (Milestone 1)");
-
-  uint64_t ShiftAmount = Amt->getZExtValue();
   unsigned SingleBitOpc;
+  unsigned RealOpc; // Moe::SHL/SRL/SRA - the loop body emitVarShift builds.
   switch (Op.getOpcode()) {
   case ISD::SHL:
     SingleBitOpc = MoeISD::SHL1;
+    RealOpc = Moe::SHL;
     break;
   case ISD::SRL:
     SingleBitOpc = MoeISD::SRL1;
+    RealOpc = Moe::SRL;
     break;
   case ISD::SRA:
     SingleBitOpc = MoeISD::SRA1;
+    RealOpc = Moe::SRA;
     break;
   default:
     llvm_unreachable("not a shift");
   }
 
+  auto *Amt = dyn_cast<ConstantSDNode>(N->getOperand(1));
+  if (!Amt) {
+    // Not a constant amount - build VARSHIFTPSEUDO directly as a machine
+    // node (bypassing SelectionDAG pattern matching, same as LowerMUL),
+    // expanded into a real runtime loop by emitVarShift after instruction
+    // selection.
+    SDValue OpcConst = DAG.getTargetConstant(RealOpc, dl, MVT::i32);
+    return SDValue(DAG.getMachineNode(Moe::VARSHIFTPSEUDO, dl, VT,
+                                       N->getOperand(0), N->getOperand(1),
+                                       OpcConst),
+                   0);
+  }
+
+  uint64_t ShiftAmount = Amt->getZExtValue();
   SDValue Result = N->getOperand(0);
   while (ShiftAmount--)
     Result = DAG.getNode(SingleBitOpc, dl, VT, Result);
   return Result;
+}
+
+//===----------------------------------------------------------------------===//
+// Sub-word (byte/halfword) extending loads - see LOADrr_B/LOADrr_H's comment
+// in MoeInstrInfo.td for why these need real multi-instruction sequences
+// rather than a single Pat-matched instruction: a Byte/Halfword-size LOAD
+// only merges into the selected lane of its destination register, leaving
+// the rest unchanged, so zext needs the destination zeroed first and sext
+// needs the already-working constant-shift-chain machinery (SHL1/SRA1 from
+// LowerShifts above) to discard the garbage upper bits. Built as straight-
+// line DAG.getMachineNode chaining (mirroring LowerMUL's direct construction
+// of MULPSEUDO), not a pseudo + custom inserter, since this sequence never
+// branches or loops - no new MachineBasicBlock is needed.
+//===----------------------------------------------------------------------===//
+
+SDValue MoeTargetLowering::LowerExtLoad(SDValue Op, SelectionDAG &DAG) const {
+  LoadSDNode *LD = cast<LoadSDNode>(Op);
+  ISD::LoadExtType ExtType = LD->getExtensionType();
+  if (ExtType == ISD::NON_EXTLOAD)
+    return SDValue(); // word loads stay on the existing, already-working Pat path
+
+  EVT MemVT = LD->getMemoryVT();
+  assert((MemVT == MVT::i8 || MemVT == MVT::i16) &&
+         "Moe: only byte/halfword extending loads are custom-lowered");
+  SDLoc dl(Op);
+  SDValue Chain = LD->getChain();
+  SDValue Base = LD->getBasePtr();
+  SDValue Offset = DAG.getTargetConstant(0, dl, MVT::i32);
+
+  // Moe has no lowering yet for a bare stack-object address used as a plain
+  // value (a separate, known gap - see the Milestone 6 plan's "FrameIndex-
+  // as-value" note) - only as a LOAD/STORE address, which this function's
+  // own raw byte/halfword loads below need to build manually rather than
+  // through the moeaddr_ri ComplexPattern's usual Pat-matching path. Fail
+  // loudly here rather than silently mis-selecting; this only affects a
+  // sub-word access straight through a local (stack) variable's own address,
+  // not the common case of a computed pointer (struct field, array element)
+  // or an already-materialized global address.
+  if (Base.getOpcode() == ISD::FrameIndex)
+    report_fatal_error(
+        "Moe: sub-word access directly through a stack-local variable's "
+        "address is not yet supported (see the Milestone 6 plan's "
+        "FrameIndex-as-value gap)");
+
+  unsigned RawLoadOpc = (MemVT == MVT::i8) ? Moe::LOADrr_B : Moe::LOADrr_H;
+  SDVTList VTs = DAG.getVTList(MVT::i32, MVT::Other);
+
+  if (ExtType == ISD::SEXTLOAD) {
+    // The raw load's tied "old value" input can be any i32 SDValue - its
+    // garbage upper bits are discarded by the shift chain below regardless
+    // of what they are.
+    SDNode *RawLoad = DAG.getMachineNode(RawLoadOpc, dl, VTs,
+                                          {Base, Base, Offset, Chain});
+    DAG.setNodeMemRefs(cast<MachineSDNode>(RawLoad), {LD->getMemOperand()});
+    SDValue Result = SDValue(RawLoad, 0);
+    unsigned ShiftCount = 32 - MemVT.getSizeInBits();
+    for (unsigned i = 0; i < ShiftCount; ++i)
+      Result = DAG.getNode(MoeISD::SHL1, dl, MVT::i32, Result);
+    for (unsigned i = 0; i < ShiftCount; ++i)
+      Result = DAG.getNode(MoeISD::SRA1, dl, MVT::i32, Result);
+    return DAG.getMergeValues({Result, SDValue(RawLoad, 1)}, dl);
+  }
+
+  // ZEXTLOAD / EXTLOAD: zero the destination first, then the raw load
+  // merges into the now-zero low lane. The zero must be built via
+  // DAG.getMachineNode(Moe::XOR, ...), NOT DAG.getNode(ISD::XOR, ...) - the
+  // generic, target-independent legalizer constant-folds X^X to a Constant 0
+  // node before instruction selection ever runs (confirmed via
+  // -print-after-all while designing this), silently defeating the
+  // self-zero trick (the same one emitMul's init block already uses at the
+  // MachineInstr level, where this fold doesn't apply) if built the
+  // "obvious" DAG-level way.
+  SDNode *Zero = DAG.getMachineNode(Moe::XOR, dl, MVT::i32, Base, Base);
+  SDNode *RawLoad = DAG.getMachineNode(
+      RawLoadOpc, dl, VTs, {SDValue(Zero, 0), Base, Offset, Chain});
+  DAG.setNodeMemRefs(cast<MachineSDNode>(RawLoad), {LD->getMemOperand()});
+  return DAG.getMergeValues({SDValue(RawLoad, 0), SDValue(RawLoad, 1)}, dl);
 }
 
 //===----------------------------------------------------------------------===//
@@ -514,6 +630,8 @@ MoeTargetLowering::EmitInstrWithCustomInserter(MachineInstr &MI,
     return emitDivRem(MI, BB);
   case Moe::SDIVMODPSEUDO:
     return emitSDivRem(MI, BB);
+  case Moe::VARSHIFTPSEUDO:
+    return emitVarShift(MI, BB);
   default:
     llvm_unreachable("Unexpected instr type to insert");
   }
@@ -773,6 +891,114 @@ MachineBasicBlock *MoeTargetLowering::emitMul(MachineInstr &MI,
   // suffices - no PHI needed for a single incoming value.
   BuildMI(*ExitBB, ExitBB->begin(), DL, TII->get(TargetOpcode::COPY), DstReg)
       .addReg(ResultNext);
+
+  MI.eraseFromParent();
+  return ExitBB;
+}
+
+//===----------------------------------------------------------------------===//
+// Software variable-amount shift - same runtime-loop shape as emitMul, but
+// simpler (no conditional add step: every iteration does the same
+// unconditional single-bit shift) and, critically, WHILE-shaped rather than
+// emitMul/emitDivRem's do-while shape: a runtime shift amount of 0 is valid
+// and common and must produce the input unchanged, so the counter-vs-amount
+// check must happen before any shift executes, not after (emitMul's
+// do-while shape is only safe there because MUL/DIV always run exactly 32
+// iterations regardless of operand value).
+//
+// Blocks (BB is VARSHIFTPSEUDO's parent block, split at the pseudo):
+//   BB:         value/amount copies (Value0, Amt0); counter seeded to 0 via
+//               self-XOR (same trick emitMul's BB uses); falls through to
+//               LoopBB. Amt0 is loop-invariant, so it's referenced directly
+//               by LoopBB rather than threaded through a PHI (the same way
+//               emitMul's Bound is referenced directly by ContinueBB).
+//   LoopBB:     PHI-merges ValuePhi/CounterPhi (back-edge values defined in
+//               ContinueBB); compares CounterPhi against Amt0 - if equal,
+//               the requested number of shifts has already happened, so
+//               branch to ExitBB (this is what makes amt=0 correct: on the
+//               very first pass through LoopBB, CounterPhi is still 0, so
+//               an amt of 0 branches straight to ExitBB without ever
+//               reaching ContinueBB); otherwise falls through to ContinueBB.
+//   ContinueBB: one unconditional single-bit shift (Moe::SHL/SRL/SRA,
+//               selected by the pseudo's $opc operand) on ValuePhi ->
+//               ValueNext; increments CounterPhi by 1 -> CounterNext;
+//               unconditional jump back to LoopBB.
+//   ExitBB:     receives VARSHIFTPSEUDO's original successors; copies
+//               ValuePhi (the value as of the moment the counter reached
+//               the requested amount) into the pseudo's original
+//               destination register.
+//===----------------------------------------------------------------------===//
+
+MachineBasicBlock *MoeTargetLowering::emitVarShift(MachineInstr &MI,
+                                                    MachineBasicBlock *BB) const {
+  const TargetInstrInfo *TII = BB->getParent()->getSubtarget().getInstrInfo();
+  DebugLoc DL = MI.getDebugLoc();
+  MachineFunction *MF = BB->getParent();
+  MachineRegisterInfo &MRI = MF->getRegInfo();
+  const TargetRegisterClass *RC = &Moe::GPRRegClass;
+
+  Register DstReg = MI.getOperand(0).getReg();
+  Register ValReg = MI.getOperand(1).getReg();
+  Register AmtReg = MI.getOperand(2).getReg();
+  unsigned ShiftOpc = MI.getOperand(3).getImm();
+
+  const BasicBlock *LLVM_BB = BB->getBasicBlock();
+  MachineFunction::iterator InsertPt = ++BB->getIterator();
+  MachineBasicBlock *LoopBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *ContinueBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *ExitBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MF->insert(InsertPt, LoopBB);
+  MF->insert(InsertPt, ContinueBB);
+  MF->insert(InsertPt, ExitBB);
+
+  ExitBB->splice(ExitBB->begin(), BB,
+                 std::next(MachineBasicBlock::iterator(MI)), BB->end());
+  ExitBB->transferSuccessorsAndUpdatePHIs(BB);
+
+  BB->addSuccessor(LoopBB);
+  LoopBB->addSuccessor(ExitBB);     // counter == amount: done
+  LoopBB->addSuccessor(ContinueBB); // counter != amount: fall through, shift
+  ContinueBB->addSuccessor(LoopBB); // always loop back
+
+  Register Value0 = MRI.createVirtualRegister(RC);
+  Register Amt0 = MRI.createVirtualRegister(RC);
+  Register Counter0 = MRI.createVirtualRegister(RC);
+
+  Register ValuePhi = MRI.createVirtualRegister(RC);
+  Register CounterPhi = MRI.createVirtualRegister(RC);
+  Register ValueNext = MRI.createVirtualRegister(RC);
+  Register CounterNext = MRI.createVirtualRegister(RC);
+
+  // BB
+  BuildMI(*BB, MI, DL, TII->get(TargetOpcode::COPY), Value0).addReg(ValReg);
+  BuildMI(*BB, MI, DL, TII->get(TargetOpcode::COPY), Amt0).addReg(AmtReg);
+  BuildMI(*BB, MI, DL, TII->get(Moe::XOR), Counter0)
+      .addReg(Value0)
+      .addReg(Value0);
+
+  // LoopBB
+  BuildMI(LoopBB, DL, TII->get(TargetOpcode::PHI), ValuePhi)
+      .addReg(Value0).addMBB(BB)
+      .addReg(ValueNext).addMBB(ContinueBB);
+  BuildMI(LoopBB, DL, TII->get(TargetOpcode::PHI), CounterPhi)
+      .addReg(Counter0).addMBB(BB)
+      .addReg(CounterNext).addMBB(ContinueBB);
+  BuildMI(LoopBB, DL, TII->get(Moe::SUBcmp)).addReg(CounterPhi).addReg(Amt0);
+  BuildMI(LoopBB, DL, TII->get(Moe::JCC))
+      .addMBB(ExitBB)
+      .addImm(MoeCC::COND_EQ);
+
+  // ContinueBB
+  BuildMI(ContinueBB, DL, TII->get(ShiftOpc), ValueNext).addReg(ValuePhi);
+  BuildMI(ContinueBB, DL, TII->get(Moe::INCREMENT), CounterNext)
+      .addReg(CounterPhi)
+      .addImm(1);
+  BuildMI(ContinueBB, DL, TII->get(Moe::JMP)).addMBB(LoopBB);
+
+  // ExitBB: LoopBB is ExitBB's only predecessor, so a plain COPY suffices -
+  // no PHI needed for a single incoming value.
+  BuildMI(*ExitBB, ExitBB->begin(), DL, TII->get(TargetOpcode::COPY), DstReg)
+      .addReg(ValuePhi);
 
   MI.eraseFromParent();
   return ExitBB;

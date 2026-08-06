@@ -152,6 +152,22 @@ let usesCustomInserter = 1 in
 def SDIVMODPSEUDO : MoePseudo<(outs GPR:$q, GPR:$r), (ins GPR:$a, GPR:$b),
                                "#SDIVMOD $q, $r, $a, $b", []>;
 
+// Software variable-amount shift (see the report_fatal_error this replaces in
+// MoeISelLowering::LowerShifts): SHIFT moves exactly one bit per instruction
+// with no shift-count field, so a shift by a runtime-computed amount needs a
+// runtime loop - the same shape as MULPSEUDO's loop but simpler (no
+// conditional add step, just one unconditional single-bit shift per
+// iteration). One pseudo shared by SHL/SRL/SRA, discriminated by an
+// immediate opcode-selector operand (which real single-bit-shift opcode the
+// loop body should use), since the block-wiring is otherwise identical
+// across all three - mirrors DIVMODPSEUDO being shared by UDIV and UREM.
+// Constructed directly as a machine node in LowerShifts's non-constant-amount
+// branch (not matched via a SelectionDAG Pat), so no pattern is needed here.
+let usesCustomInserter = 1 in
+def VARSHIFTPSEUDO : MoePseudo<(outs GPR:$dst),
+                                (ins GPR:$val, GPR:$amt, i32imm:$opc),
+                                "#VARSHIFT $dst, $val, $amt, $opc", []>;
+
 //===----------------------------------------------------------------------===//
 // MOVE (0b0100) - the only register-to-register copy; also how a computed
 // value redirects control flow (MOVE ... -> IA), used by RET's expansion.
@@ -337,3 +353,56 @@ def LOADrr : LoadStoreForm<0b0101, 0b10, (outs GPR:$reg), (ins moemem:$addr),
 def STORErr : LoadStoreForm<0b0110, 0b10, (outs), (ins GPR:$reg, moemem:$addr),
                              "store.w $reg -> $addr",
                              [(store GPR:$reg, moeaddr_ri:$addr)]>;
+
+//===----------------------------------------------------------------------===//
+// Sub-word (byte/halfword) LOAD/STORE, register-indirect addressing mode -
+// see 'Size selection'/'Bytes selection' in the Encoding chapter. STORE has
+// a real Pat matching a plain truncstore directly: memory isn't
+// register-lane-merged, so a single instruction (size=Byte/Halfword,
+// bytesel=0 - confirmed against emulator/src/execute.rs that bytesel only
+// selects a *register* lane, never adjusting the effective memory address)
+// is all a byte/halfword store needs.
+//
+// LOAD is different and deliberately Pat-less (mirrors PUSH/POP's
+// empty-pattern precedent): per 'Handling words, halfwords and bytes' in the
+// Encoding chapter, a Byte/Halfword-size LOAD only overwrites the selected
+// lane of its destination register, leaving the rest unchanged - unlike most
+// RISC ISAs' natively-extending loads. So this raw instruction is only ever
+// useful as a building block for a real zext/sext, built explicitly by
+// MoeISelLowering::LowerExtLoad (zero the destination first for zext, or
+// discard the untouched garbage bits via the existing constant-shift-chain
+// machinery for sext) - never matched from a bare load/zextload/sextload DAG
+// node standalone. The tied "$dst = $oldval" operand models the hardware's
+// genuine partial-merge-write semantic directly, the same way INCREMENT's
+// existing "$o = $oin" tie already does for its own read-modify-write.
+//===----------------------------------------------------------------------===//
+
+let bytesel = 0b00, size = 0b01 in // Byte
+def STORErr_B : LoadStoreForm<0b0110, 0b10, (outs), (ins GPR:$reg, moemem:$addr),
+                               "store.b $reg -> $addr",
+                               [(truncstorei8 GPR:$reg, moeaddr_ri:$addr)]>;
+
+let bytesel = 0b00, size = 0b10 in // Halfword
+def STORErr_H : LoadStoreForm<0b0110, 0b10, (outs), (ins GPR:$reg, moemem:$addr),
+                               "store.h $reg -> $addr",
+                               [(truncstorei16 GPR:$reg, moeaddr_ri:$addr)]>;
+
+// The output must be named $reg (not e.g. $dst) - LoadStoreForm's bits<4>
+// reg encoding field auto-binds to an operand of that exact name, the same
+// way every other LoadStoreForm instruction's destination/source operand is
+// named $reg.
+let bytesel = 0b00, size = 0b01 in { // Byte
+def LOADrr_B : LoadStoreForm<0b0101, 0b10, (outs GPR:$reg),
+                              (ins GPR:$oldval, moemem:$addr),
+                              "load.b $addr -> $reg", []> {
+  let Constraints = "$reg = $oldval";
+}
+}
+
+let bytesel = 0b00, size = 0b10 in { // Halfword
+def LOADrr_H : LoadStoreForm<0b0101, 0b10, (outs GPR:$reg),
+                              (ins GPR:$oldval, moemem:$addr),
+                              "load.h $addr -> $reg", []> {
+  let Constraints = "$reg = $oldval";
+}
+}

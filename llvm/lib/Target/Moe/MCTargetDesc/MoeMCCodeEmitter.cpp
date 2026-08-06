@@ -104,7 +104,20 @@ void MoeMCCodeEmitter::emitTrailingWord(const MCInst &MI,
     break;
   case Moe::LOADrr:
   case Moe::STORErr:
+  // STORErr_B/H have the same (ins GPR:$reg, moemem:$addr) shape as
+  // STORErr - no tied operand - so the base register is still operand 1.
+  case Moe::STORErr_B:
+  case Moe::STORErr_H:
     MemBaseOperand = 1;
+    break;
+  // LOADrr_B/H additionally have a tied $oldval input ((ins GPR:$oldval,
+  // moemem:$addr)) ahead of the address, which remains a distinct MCInst
+  // operand despite the tie (ties only constrain register allocation, they
+  // don't collapse the operand at the MC level) - shifting the base
+  // register to operand 2, not 1.
+  case Moe::LOADrr_B:
+  case Moe::LOADrr_H:
+    MemBaseOperand = 2;
     break;
   default:
     return; // No trailing operand for this instruction.
