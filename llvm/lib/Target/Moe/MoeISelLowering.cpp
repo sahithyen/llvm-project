@@ -734,6 +734,19 @@ MachineBasicBlock *MoeTargetLowering::emitCall(MachineInstr &MI,
   // address, so the label must exist in the final assembly even though
   // nothing else branches to it.
   ContinueBB->setLabelMustBeEmitted();
+  // The label's only real use (below) is as a raw data value in a constant
+  // pool entry - invisible to the normal "is this MBB referenced anywhere"
+  // scan every CFG-cleanup pass relies on. At -O0 none of those passes run,
+  // so this was invisible; at -O1+, BranchFolding sees a trivial single-
+  // predecessor fallthrough block and merges/deletes it, leaving the
+  // constant pool's LOADabs referencing a symbol that's never emitted
+  // ("Undefined temporary symbol .LBBn_m" from the MC assembler - confirmed
+  // via llc -O1 -filetype=obj on every existing test with a real CALL).
+  // setMachineBlockAddressTaken() is the standard flag BranchFolding,
+  // TailDuplicator, CodeGenPrepare, IfConversion, GCEmptyBasicBlocks,
+  // MachineOutliner and BasicBlockPathCloning all check before touching a
+  // block for exactly this reason.
+  ContinueBB->setMachineBlockAddressTaken();
   MCSymbol *RetSym = ContinueBB->getSymbol();
 
   // LOADabs always dereferences its trailing address operand (loads
@@ -764,7 +777,23 @@ MachineBasicBlock *MoeTargetLowering::emitCall(MachineInstr &MI,
   // linear scan doesn't know the call clobbers it in between) - which broke
   // for a zero-argument call, where GP0 was never touched at all before the
   // read. Declaring the real semantic fact directly fixes both cases.
-  MIB.addReg(Moe::GP0, RegState::ImplicitDefine);
+  //
+  // GP1-GP3 need the same treatment, for a related but distinct reason: they
+  // (like GP0) are caller-saved per the ABI (only GP6/GP7 are callee-saved -
+  // see MoeRegisterInfo::getCalleeSavedRegs), so the callee is free to use
+  // them as scratch regardless of whether THIS call site happened to pass an
+  // argument through them - LowerCall only ever attached them as implicit
+  // *uses* (the argument values going in), never as clobbers. RegAllocFast
+  // never noticed: it reloads every value from its spill slot before each
+  // use regardless of clobber info, so an incomplete clobber list was
+  // invisible at -O0. The Greedy allocator (-O1+) trusts clobber info to
+  // decide what's safe to keep live across a call in a register - without
+  // this, it could leave some other still-needed value sitting in GP1/GP2/
+  // GP3 across the call, for the callee to silently stomp on. Confirmed via
+  // a real, reproducible wrong-answer bug (not a crash) on cross_call_test.ll
+  // at -O1 - GP0 read back as 0 instead of the second call's real result.
+  for (unsigned Reg : {Moe::GP0, Moe::GP1, Moe::GP2, Moe::GP3})
+    MIB.addReg(Reg, RegState::ImplicitDefine);
 
   MI.eraseFromParent();
   return ContinueBB;

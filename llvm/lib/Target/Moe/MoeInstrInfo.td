@@ -221,7 +221,26 @@ def SUB : AddSubForm<0b1010, (outs GPR:$o), (ins GPR:$a, GPR:$b),
 // across a SUBcmp (see the Milestone 3 plan: this surfaced as a real bug -
 // the software-multiply loop's counter got silently allocated to GP0 and
 // destroyed by its own loop-condition SUBcmp before this fix).
-let isCompare = 1, o = 0, Defs = [GP0] in
+// hasSideEffects = 1: SUBcmp's real effect - the ALU flags it sets for the
+// conditional branch that (by construction) always immediately follows it -
+// is expressed only as SelectionDAG glue (Moecmp's SDNPOutGlue/Moebrcc's
+// SDNPInGlue), a pre-ISel-only mechanism. Once lowered to a real MachineInstr,
+// the only thing this pseudo declares is Defs=[GP0], which is dead by
+// design (the compare result itself is always discarded) - so with
+// hasSideEffects left at its default 0, DeadMachineInstructionElim (part of
+// the -O1+ pipeline, not -O0's) correctly-by-its-own-model but wrongly-in-
+// reality deletes the whole instruction as unused, silently breaking every
+// loop whose exit condition depends on it (the flags it should have set
+// never get set, so the following conditional branch reads stale/wrong
+// flags). Confirmed via a real, reproducible infinite loop (not a crash) in
+// mul_test.ll/muldiv_test.ll/sdiv_test.ll/cross_call_test.ll at -O1 - traced
+// with moe-emu --trace, showing the SUBcmp instruction simply missing from
+// the loop body between INCREMENT and the conditional JUMP that depends on
+// it. hasSideEffects=1 is the standard LLVM idiom for exactly this situation
+// (an instruction whose real effect isn't captured by its declared Defs/Uses)
+// - it blocks deletion and discourages reordering across it, for every
+// machine pass, not just this one that was caught empirically.
+let isCompare = 1, o = 0, Defs = [GP0], hasSideEffects = 1 in
 def SUBcmp : AddSubForm<0b1010, (outs), (ins GPR:$a, GPR:$b),
                          "sub $a, $b -> (dead)", [(Moecmp GPR:$a, GPR:$b)]>;
 
@@ -249,6 +268,23 @@ def XOR : AluTestForm<0b1110, (outs GPR:$o), (ins GPR:$a, GPR:$b),
 // Milestone 1 (its test case only needs small constant shift amounts).
 //===----------------------------------------------------------------------===//
 
+// hasSideEffects = 1 on the whole family: like SUBcmp (see its own comment),
+// every SHIFT sets the real ALU carry flag as a side effect that's never
+// declared as a Def/Use anywhere - normally invisible, but emitMul/
+// emitDivRem/emitSDivRem/emitVarShift's hand-built loops rely on that carry
+// flowing undisturbed from one specific SHIFT into the very next
+// instruction (a JCC testing it directly, for SHL/SRL/SRA; another SHLc/SRLc
+// consuming it as carry-in, for the div/mod loops' remainder-shift chaining
+// - see LowerUDIV's comment on SHLc). Confirmed via a real, reproducible
+// wrong-answer bug at -O1 (not a crash): llc's own -O1 assembly for
+// mul_test.ll shows LoopBB's SRL sunk down past the JCC that's supposed to
+// test its carry output, into the block on the other side of that branch -
+// a machine-sinking-style pass moved it because nothing declared the
+// dependency. Same fix as SUBcmp and for the same reason: this is the
+// standard LLVM idiom for "this instruction's real effect isn't captured by
+// its declared Defs/Uses," blocking exactly this kind of reordering for
+// every machine pass, not just the one caught empirically.
+let hasSideEffects = 1 in {
 let right = 0 in
 def SHL : ShiftForm<(outs GPR:$o), (ins GPR:$a), "shift.left $a -> $o",
                      [(set GPR:$o, (Moeshl1 GPR:$a))]>;
@@ -266,6 +302,7 @@ def SHLc : ShiftForm<(outs GPR:$o), (ins GPR:$a), "shift.left.c $a -> $o", []>;
 
 let right = 1, arithmetic = 0, carryin = 1 in
 def SRLc : ShiftForm<(outs GPR:$o), (ins GPR:$a), "shift.right.c $a -> $o", []>;
+}
 
 //===----------------------------------------------------------------------===//
 // INCREMENT (0b1011) - o can be any of the 16 registers, but Milestone 1
