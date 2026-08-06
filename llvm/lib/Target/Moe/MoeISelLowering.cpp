@@ -279,20 +279,13 @@ SDValue MoeTargetLowering::LowerExtLoad(SDValue Op, SelectionDAG &DAG) const {
   SDValue Base = LD->getBasePtr();
   SDValue Offset = DAG.getTargetConstant(0, dl, MVT::i32);
 
-  // Moe has no lowering yet for a bare stack-object address used as a plain
-  // value (a separate, known gap - see the Milestone 6 plan's "FrameIndex-
-  // as-value" note) - only as a LOAD/STORE address, which this function's
-  // own raw byte/halfword loads below need to build manually rather than
-  // through the moeaddr_ri ComplexPattern's usual Pat-matching path. Fail
-  // loudly here rather than silently mis-selecting; this only affects a
-  // sub-word access straight through a local (stack) variable's own address,
-  // not the common case of a computed pointer (struct field, array element)
-  // or an already-materialized global address.
-  if (Base.getOpcode() == ISD::FrameIndex)
-    report_fatal_error(
-        "Moe: sub-word access directly through a stack-local variable's "
-        "address is not yet supported (see the Milestone 6 plan's "
-        "FrameIndex-as-value gap)");
+  // A FrameIndex-typed Base (sub-word access straight through a local
+  // variable's own address) is fine here since Milestone 7's FIADDR pseudo:
+  // Base is still an ordinary (non-machine) FrameIndex SDValue at this
+  // point, and MoeDAGToDAGISel::Select's ISD::FrameIndex case selects it
+  // into FIADDR independently, before this function's own hand-built
+  // machine nodes (which reference Base as an operand) get emitted - see
+  // the Milestone 7 plan.
 
   unsigned RawLoadOpc = (MemVT == MVT::i8) ? Moe::LOADrr_B : Moe::LOADrr_H;
   SDVTList VTs = DAG.getVTList(MVT::i32, MVT::Other);

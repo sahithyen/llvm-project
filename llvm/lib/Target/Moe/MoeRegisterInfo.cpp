@@ -12,11 +12,14 @@
 
 #include "MoeRegisterInfo.h"
 #include "MoeFrameLowering.h"
+#include "MoeInstrInfo.h"
 #include "llvm/ADT/BitVector.h"
+#include "llvm/CodeGen/MachineConstantPool.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/Support/ErrorHandling.h"
 
@@ -90,6 +93,49 @@ bool MoeRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
   int Offset = MF.getFrameInfo().getObjectOffset(FrameIndex) +
                MF.getFrameInfo().getStackSize();
   Offset += MI.getOperand(FIOperandNum + 1).getImm();
+
+  if (MI.getOpcode() == Moe::FIADDR) {
+    // A bare stack-object ADDRESS used as an ordinary value (see the
+    // Milestone 7 plan's "FrameIndex-as-value" fix) - unlike every other
+    // FI-bearing instruction (LOADrr/STORErr/spill code), whose (reg, imm)
+    // operand pair can just be rewritten in place because the consuming
+    // instruction already dereferences memory at (SP + Offset), FIADDR's
+    // *result* must equal SP + Offset itself, and Moe has no register+
+    // immediate ADD (see MoeFrameLowering.cpp's header comment) - so this
+    // needs the same real MOVE/LOADabs/ADD sequence
+    // MoeFrameLowering::adjustStackPointer already established for "compute
+    // SP adjusted by an arbitrary offset with no fresh virtual registers
+    // available" (GP4/GP5 are excluded from register allocation entirely -
+    // see getReservedRegs above - so nothing RegAllocFast ever assigned can
+    // be live in them here, the same invariant adjustStackPointer/emitCall's
+    // own hand-built GP4/GP5 sequences already rely on).
+    //
+    // Always BuildMI-and-erase, even for Offset == 0 (rather than mutating
+    // the pseudo in place for that case), to avoid any risk of operand-index
+    // confusion from changing a 2-operand pseudo's MCInstrDesc mid-flight.
+    MachineBasicBlock &MBB = *MI.getParent();
+    const MoeInstrInfo &TII =
+        *static_cast<const MoeInstrInfo *>(MF.getSubtarget().getInstrInfo());
+    DebugLoc DL = MI.getDebugLoc();
+    Register DstReg = MI.getOperand(0).getReg();
+
+    if (Offset == 0) {
+      BuildMI(MBB, II, DL, TII.get(Moe::MOVE), DstReg).addReg(Moe::SP);
+    } else {
+      Constant *CV = ConstantInt::get(
+          Type::getInt32Ty(MF.getFunction().getContext()), (uint64_t)Offset);
+      unsigned CPI = MF.getConstantPool()->getConstantPoolIndex(CV, Align(4));
+
+      BuildMI(MBB, II, DL, TII.get(Moe::MOVE), Moe::GP4).addReg(Moe::SP);
+      BuildMI(MBB, II, DL, TII.get(Moe::LOADabs), Moe::GP5)
+          .addConstantPoolIndex(CPI);
+      BuildMI(MBB, II, DL, TII.get(Moe::ADD), DstReg)
+          .addReg(Moe::GP4)
+          .addReg(Moe::GP5);
+    }
+    MI.eraseFromParent();
+    return false;
+  }
 
   MI.getOperand(FIOperandNum).ChangeToRegister(Moe::SP, false);
   MI.getOperand(FIOperandNum + 1).ChangeToImmediate(Offset);

@@ -109,5 +109,22 @@ void MoeDAGToDAGISel::Select(SDNode *Node) {
     return;
   }
 
+  // A bare stack-object address used as an ordinary value (not as a
+  // LOAD/STORE address operand - that case is already absorbed into
+  // moeaddr_ri/SelectAddr's Pat matching before a FrameIndex node would ever
+  // reach here as an independent root). ISD::FrameIndex defaults to Legal
+  // (never marked Custom - see the Milestone 7 plan), so it's never routed
+  // through MoeTargetLowering::LowerOperation; it must be handled directly
+  // here, mirroring MSP430's identical ISD::FrameIndex case in its own
+  // Select() override.
+  if (Node->getOpcode() == ISD::FrameIndex) {
+    SDLoc dl(Node);
+    int FI = cast<FrameIndexSDNode>(Node)->getIndex();
+    SDValue TFI = CurDAG->getTargetFrameIndex(FI, Node->getValueType(0));
+    SDValue Disp = CurDAG->getTargetConstant(0, dl, MVT::i32);
+    CurDAG->SelectNodeTo(Node, Moe::FIADDR, Node->getValueType(0), TFI, Disp);
+    return;
+  }
+
   SelectCode(Node);
 }

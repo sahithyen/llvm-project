@@ -168,6 +168,10 @@ def VARSHIFTPSEUDO : MoePseudo<(outs GPR:$dst),
                                 (ins GPR:$val, GPR:$amt, i32imm:$opc),
                                 "#VARSHIFT $dst, $val, $amt, $opc", []>;
 
+// FIADDR (a bare stack-object address used as an ordinary i32 value) is
+// defined further below, after moemem, which its (ins) list depends on - see
+// its definition next to LOADrr/STORErr for the full explanation.
+
 //===----------------------------------------------------------------------===//
 // MOVE (0b0100) - the only register-to-register copy; also how a computed
 // value redirects control flow (MOVE ... -> IA), used by RET's expansion.
@@ -353,6 +357,26 @@ def LOADrr : LoadStoreForm<0b0101, 0b10, (outs GPR:$reg), (ins moemem:$addr),
 def STORErr : LoadStoreForm<0b0110, 0b10, (outs), (ins GPR:$reg, moemem:$addr),
                              "store.w $reg -> $addr",
                              [(store GPR:$reg, moeaddr_ri:$addr)]>;
+
+// A bare stack-object address used as an ordinary i32 VALUE (as opposed to a
+// LOAD/STORE address operand, which already works via moeaddr_ri/SelectAddr
+// above - see the Milestone 6 plan's "FrameIndex-as-value" gap). Constructed
+// directly as a machine node by MoeISelDAGToDAG::Select's ISD::FrameIndex
+// case (mirroring how MULPSEUDO is built directly by LowerMUL, not
+// Pat-matched), carrying the same (TargetFrameIndex, disp) operand pair
+// SelectAddr already produces for the address-operand case, via moemem - so
+// eliminateFrameIndex's existing per-instruction offset computation applies
+// uniformly to this and to LOADrr/STORErr alike. Deliberately has NO
+// usesCustomInserter: unlike MULPSEUDO/DIVMODPSEUDO/VARSHIFTPSEUDO,
+// expanding this pseudo needs the object's final SP-relative offset, which
+// isn't known until PrologEpilogInserter runs - so all of its expansion (not
+// just the offset arithmetic) is deferred to
+// MoeRegisterInfo::eliminateFrameIndex's FIADDR special case, which BuildMI's
+// a real MOVE/LOADabs/ADD sequence using the GP4/GP5 scratch convention
+// MoeFrameLowering::adjustStackPointer already established, then erases the
+// pseudo.
+def FIADDR : MoePseudo<(outs GPR:$dst), (ins moemem:$addr),
+                        "#FIADDR $dst, $addr", []>;
 
 //===----------------------------------------------------------------------===//
 // Sub-word (byte/halfword) LOAD/STORE, register-indirect addressing mode -
