@@ -159,6 +159,21 @@ let usesCustomInserter = 1 in
 def SDIVMODPSEUDO : MoePseudo<(outs GPR:$q, GPR:$r), (ins GPR:$a, GPR:$b),
                                "#SDIVMOD $q, $r, $a, $b", []>;
 
+// Value-producing compare (Milestone 11): Moe has no CMP/SELECT/SETCC
+// instruction, only a flags-setting SUBcmp consumed by a conditional branch
+// (see BR_CC above) - so materializing a comparison's 0/1 result as a real
+// value (needed by the generic i64-from-i32-halves legalizer's carry
+// detection, and by ordinary C like `int f(int a,int b){return a<b;}`) needs
+// a real branchy sequence, not a single instruction. Constructed directly as
+// a machine node in LowerSETCC (not matched via a SelectionDAG Pat, same as
+// MULPSEUDO above), and expanded by MoeTargetLowering::emitSetCC into
+// SUBcmp+JCC+two 0/1-producing blocks merged by a PHI - the same shape
+// emitCondNegate already uses for "produce a value from a branch condition",
+// just testing $a against $b (with $cond) instead of a fixed sign test.
+let usesCustomInserter = 1 in
+def SETCCPSEUDO : MoePseudo<(outs GPR:$dst), (ins GPR:$a, GPR:$b, i32imm:$cond),
+                             "#SETCC $dst, $a, $b, $cond", []>;
+
 // Software variable-amount shift (see the report_fatal_error this replaces in
 // MoeISelLowering::LowerShifts): SHIFT moves exactly one bit per instruction
 // with no shift-count field, so a shift by a runtime-computed amount needs a
@@ -198,6 +213,24 @@ def MOVE : MoveForm<(outs AllReg:$to), (ins AllReg:$from), "move $from -> $to", 
 // register; multi-word carry chains aren't needed by Milestone 1).
 //===----------------------------------------------------------------------===//
 
+// Defs = [F] (here and on every other ALU-family instruction below - AND/OR/
+// XOR, INCREMENT, the SHIFT family, SUBcmp): real hardware sets the ALU
+// flags on every one of these, not just SUBcmp/SHIFT. F (the real, already-
+// defined architectural Flags register - see registers.md - already
+// permanently Reserved, so this never affects allocation) gives that a real,
+// modeled dependency instead of the bare hasSideEffects=1 barrier Milestone
+// 10 first used: hasSideEffects alone stops SUBcmp/SHIFT themselves from
+// being deleted or reordered, but does NOT stop an unrelated instruction
+// (confirmed: XOR, computing an always-taken branch's 0/1 result in
+// MoeISelLowering::emitSetCC) from being sunk into the gap between a SUBcmp
+// and the JCC reading its flags - Machine Sinking's interference analysis
+// only checks registers it knows are live, and flags weren't modeled as one.
+// Declaring Defs=[F] here (and Uses=[F] on JCC, below) closes that gap for
+// every machine pass generally, not just the one instance caught -
+// confirmed via a real, reproducible wrong-answer bug: llc -O1 sinking
+// emitSetCC's zero-result XOR between SUBcmp and JCC, so JCC tested XOR's
+// (always-zero) flags instead of the actual comparison's.
+let Defs = [F] in {
 def ADD : AddSubForm<0b1001, (outs GPR:$o), (ins GPR:$a, GPR:$b),
                       "add $a, $b -> $o",
                       [(set GPR:$o, (add GPR:$a, GPR:$b))]>;
@@ -205,6 +238,7 @@ def ADD : AddSubForm<0b1001, (outs GPR:$o), (ins GPR:$a, GPR:$b),
 def SUB : AddSubForm<0b1010, (outs GPR:$o), (ins GPR:$a, GPR:$b),
                       "sub $a, $b -> $o",
                       [(set GPR:$o, (sub GPR:$a, GPR:$b))]>;
+}
 
 // Comparison-only SUB (Test-mode-equivalent): Moe has no CMP opcode, so a
 // compare is a real SUB whose result goes to a dead scratch register and
@@ -240,7 +274,7 @@ def SUB : AddSubForm<0b1010, (outs GPR:$o), (ins GPR:$a, GPR:$b),
 // (an instruction whose real effect isn't captured by its declared Defs/Uses)
 // - it blocks deletion and discourages reordering across it, for every
 // machine pass, not just this one that was caught empirically.
-let isCompare = 1, o = 0, Defs = [GP0], hasSideEffects = 1 in
+let isCompare = 1, o = 0, Defs = [GP0, F], hasSideEffects = 1 in
 def SUBcmp : AddSubForm<0b1010, (outs), (ins GPR:$a, GPR:$b),
                          "sub $a, $b -> (dead)", [(Moecmp GPR:$a, GPR:$b)]>;
 
@@ -248,6 +282,7 @@ def SUBcmp : AddSubForm<0b1010, (outs), (ins GPR:$a, GPR:$b),
 // AND (0b1100) / OR (0b1101) / XOR (0b1110)
 //===----------------------------------------------------------------------===//
 
+let Defs = [F] in {
 def AND : AluTestForm<0b1100, (outs GPR:$o), (ins GPR:$a, GPR:$b),
                        "and $a, $b -> $o",
                        [(set GPR:$o, (and GPR:$a, GPR:$b))]>;
@@ -259,6 +294,7 @@ def OR : AluTestForm<0b1101, (outs GPR:$o), (ins GPR:$a, GPR:$b),
 def XOR : AluTestForm<0b1110, (outs GPR:$o), (ins GPR:$a, GPR:$b),
                        "xor $a, $b -> $o",
                        [(set GPR:$o, (xor GPR:$a, GPR:$b))]>;
+}
 
 //===----------------------------------------------------------------------===//
 // SHIFT (0b1111) - single bit only per instruction; ISel expands shl/lshr/
@@ -284,7 +320,7 @@ def XOR : AluTestForm<0b1110, (outs GPR:$o), (ins GPR:$a, GPR:$b),
 // standard LLVM idiom for "this instruction's real effect isn't captured by
 // its declared Defs/Uses," blocking exactly this kind of reordering for
 // every machine pass, not just the one caught empirically.
-let hasSideEffects = 1 in {
+let hasSideEffects = 1, Defs = [F] in {
 let right = 0 in
 def SHL : ShiftForm<(outs GPR:$o), (ins GPR:$a), "shift.left $a -> $o",
                      [(set GPR:$o, (Moeshl1 GPR:$a))]>;
@@ -311,6 +347,7 @@ def SRLc : ShiftForm<(outs GPR:$o), (ins GPR:$a), "shift.right.c $a -> $o", []>;
 // notes, since frame sizes can exceed INCREMENT's 6-bit/0-63 range).
 //===----------------------------------------------------------------------===//
 
+let Defs = [F] in
 def INCREMENT : IncrementForm<(outs GPR:$o), (ins GPR:$oin, i32imm:$value),
                                "increment $o += $value", []> {
   let Constraints = "$o = $oin";
@@ -328,6 +365,7 @@ let isBranch = 1, isTerminator = 1 in {
     let cond = 0; // AL
   }
 
+  let Uses = [F] in
   def JCC : JumpForm<0b00, (outs), (ins jmptarget:$dst, cc:$cond),
                       "jump.$cond $dst",
                       [(Moebrcc bb:$dst, timm:$cond)]>;

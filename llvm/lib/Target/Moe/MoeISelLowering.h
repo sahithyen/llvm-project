@@ -46,6 +46,7 @@ public:
   SDValue LowerGlobalAddress(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerConstantPool(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerBR_CC(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerSETCC(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerMUL(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerUDIV(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerUREM(SDValue Op, SelectionDAG &DAG) const;
@@ -88,6 +89,7 @@ private:
   MachineBasicBlock *emitDivRem(MachineInstr &MI, MachineBasicBlock *BB) const;
   MachineBasicBlock *emitSDivRem(MachineInstr &MI, MachineBasicBlock *BB) const;
   MachineBasicBlock *emitVarShift(MachineInstr &MI, MachineBasicBlock *BB) const;
+  MachineBasicBlock *emitSetCC(MachineInstr &MI, MachineBasicBlock *BB) const;
   Register emitCondNegate(MachineFunction *MF, MachineRegisterInfo &MRI,
                           const TargetInstrInfo *TII, const DebugLoc &DL,
                           MachineBasicBlock *&BB, Register ZeroReg,

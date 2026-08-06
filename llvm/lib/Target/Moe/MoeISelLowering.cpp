@@ -53,10 +53,15 @@ MoeTargetLowering::MoeTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::ConstantPool, MVT::i32, Custom);
 
   // No CMP instruction (a compare is a SUB whose result is discarded - see
-  // the Milestone 1 plan's ABI section) and no flag-testing SELECT/SETCC
-  // instruction, so route everything through BR_CC.
+  // the Milestone 1 plan's ABI section) and no flag-testing SELECT
+  // instruction, so route control-flow comparisons through BR_CC.
   setOperationAction(ISD::BR_CC, MVT::i32, Custom);
   setOperationAction(ISD::BRCOND, MVT::Other, Expand);
+
+  // Value-producing comparisons (Milestone 11) - see SETCCPSEUDO's def
+  // comment in MoeInstrInfo.td for why this needs a real branchy sequence
+  // (LowerSETCC/emitSetCC), not a single instruction.
+  setOperationAction(ISD::SETCC, MVT::i32, Custom);
 
   // SHIFT moves exactly one bit per instruction - see MoeISelLowering::
   // LowerShifts and the Milestone 1 plan's SHIFT notes. Variable-amount
@@ -123,6 +128,8 @@ SDValue MoeTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
     return LowerGlobalAddress(Op, DAG);
   case ISD::BR_CC:
     return LowerBR_CC(Op, DAG);
+  case ISD::SETCC:
+    return LowerSETCC(Op, DAG);
   case ISD::MUL:
     return LowerMUL(Op, DAG);
   case ISD::UDIV:
@@ -370,6 +377,21 @@ SDValue MoeTargetLowering::LowerBR_CC(SDValue Op, SelectionDAG &DAG) const {
   SDValue Flag = DAG.getNode(MoeISD::CMP, dl, MVT::Glue, LHS, RHS);
   return DAG.getNode(MoeISD::BR_CC, dl, Op.getValueType(), Chain, Dest,
                       TargetCC, Flag);
+}
+
+// Constructs SETCCPSEUDO directly as a machine node (bypassing SelectionDAG
+// pattern matching, same as LowerMUL) - emitSetCC expands it into a real
+// SUBcmp+JCC branchy sequence producing 0/1 after instruction selection. See
+// SETCCPSEUDO's def comment in MoeInstrInfo.td.
+SDValue MoeTargetLowering::LowerSETCC(SDValue Op, SelectionDAG &DAG) const {
+  SDLoc dl(Op);
+  SDValue LHS = Op.getOperand(0);
+  SDValue RHS = Op.getOperand(1);
+  ISD::CondCode CC = cast<CondCodeSDNode>(Op.getOperand(2))->get();
+  SDValue TargetCC = DAG.getTargetConstant(getMoeCondCode(CC), dl, MVT::i32);
+  return SDValue(
+      DAG.getMachineNode(Moe::SETCCPSEUDO, dl, MVT::i32, LHS, RHS, TargetCC),
+      0);
 }
 
 //===----------------------------------------------------------------------===//
@@ -641,6 +663,8 @@ MoeTargetLowering::EmitInstrWithCustomInserter(MachineInstr &MI,
     return emitSDivRem(MI, BB);
   case Moe::VARSHIFTPSEUDO:
     return emitVarShift(MI, BB);
+  case Moe::SETCCPSEUDO:
+    return emitSetCC(MI, BB);
   default:
     llvm_unreachable("Unexpected instr type to insert");
   }
@@ -1305,6 +1329,105 @@ Register MoeTargetLowering::emitCondNegate(MachineFunction *MF,
 
   BB = MergeBB;
   return Result;
+}
+
+//===----------------------------------------------------------------------===//
+// Value-producing compare (Milestone 11) - see SETCCPSEUDO's def comment in
+// MoeInstrInfo.td. Same skip/fall-through/merge shape as emitCondNegate:
+// *BB ends with SUBcmp+JCC branching to TrueBB (condition holds) and falling
+// through to FalseBB (condition doesn't hold, placed immediately after *BB
+// in insertion order so the fallthrough is real) - both set the result to a
+// self-XOR-then-optionally-INCREMENT 0/1 (the same "self-zero" and
+// tied-operand-needs-a-distinct-seed tricks emitMul's Bound/BoundZero
+// already use) and merge into DstReg via a PHI. Unlike emitCondNegate (a
+// helper called mid-block by another custom-inserter), this IS a pseudo-
+// dispatch target in its own right, so it splices/transfers *MI's original
+// block's remainder and successors the same way emitMul/emitCall do.
+//===----------------------------------------------------------------------===//
+
+MachineBasicBlock *MoeTargetLowering::emitSetCC(MachineInstr &MI,
+                                                 MachineBasicBlock *BB) const {
+  const TargetInstrInfo *TII = BB->getParent()->getSubtarget().getInstrInfo();
+  DebugLoc DL = MI.getDebugLoc();
+  MachineFunction *MF = BB->getParent();
+  MachineRegisterInfo &MRI = MF->getRegInfo();
+  const TargetRegisterClass *RC = &Moe::GPRRegClass;
+
+  Register DstReg = MI.getOperand(0).getReg();
+  Register AReg = MI.getOperand(1).getReg();
+  Register BReg = MI.getOperand(2).getReg();
+  int64_t Cond = MI.getOperand(3).getImm();
+
+  const BasicBlock *LLVM_BB = BB->getBasicBlock();
+  MachineFunction::iterator InsertPt = ++BB->getIterator();
+  // Insertion order matters: FalseBB must land immediately after BB so BB's
+  // JCC (which explicitly branches to TrueBB, and otherwise falls through)
+  // actually falls through to it - same convention emitMul's LoopBB/AddBB
+  // ordering already relies on.
+  MachineBasicBlock *FalseBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *TrueBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *MergeBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MF->insert(InsertPt, FalseBB);
+  MF->insert(InsertPt, TrueBB);
+  MF->insert(InsertPt, MergeBB);
+
+  MergeBB->splice(MergeBB->begin(), BB,
+                   std::next(MachineBasicBlock::iterator(MI)), BB->end());
+  MergeBB->transferSuccessorsAndUpdatePHIs(BB);
+
+  BB->addSuccessor(TrueBB);   // condition holds
+  BB->addSuccessor(FalseBB);  // condition doesn't hold: fall through
+  FalseBB->addSuccessor(MergeBB);
+  TrueBB->addSuccessor(MergeBB);
+
+  Register ZeroReg = MRI.createVirtualRegister(RC);
+  Register OneSeed = MRI.createVirtualRegister(RC);
+  Register OneReg = MRI.createVirtualRegister(RC);
+
+  // ZeroReg is computed in *BB, BEFORE SUBcmp - not in FalseBB - and FalseBB
+  // is left with nothing but its terminator. This isn't just tidiness: a
+  // non-terminator instruction sitting alone in FalseBB (BB's sole
+  // fallthrough successor) is exactly what a trivial-block-merge pass (seen
+  // in practice: BranchFolding, part of the -O1+ pipeline) hoists back into
+  // BB - and since XOR's real flag-clobbering side effect is (like every
+  // ALU op except SUBcmp/SHIFT) undeclared, nothing stops it from landing
+  // between SUBcmp and the JCC that reads its flags, silently corrupting the
+  // comparison. Confirmed via a real, reproducible wrong-answer bug at -O1:
+  // exactly this hoist happened, and JCC ended up testing XOR's
+  // always-zero-flags instead of SUBcmp's. Computing ZeroReg first sidesteps
+  // the hazard entirely - nothing is left in FalseBB for any pass to hoist.
+  BuildMI(*BB, BB->end(), DL, TII->get(Moe::XOR), ZeroReg)
+      .addReg(AReg)
+      .addReg(AReg);
+  BuildMI(*BB, BB->end(), DL, TII->get(Moe::SUBcmp)).addReg(AReg).addReg(BReg);
+  BuildMI(*BB, BB->end(), DL, TII->get(Moe::JCC)).addMBB(TrueBB).addImm(Cond);
+
+  // FalseBB is placed immediately before TrueBB (not MergeBB), so - unlike
+  // AddBB's plain fallthrough in emitMul, which has nothing else in between
+  // - it needs an explicit unconditional jump to skip over TrueBB and reach
+  // MergeBB. Real Moe::JMP, not JCC+COND_AL: MoeInstrInfo::analyzeBranch
+  // (which MachineBlockPlacement/BranchFolding depend on) only recognizes
+  // the dedicated JMP opcode as unconditional - a JCC, any condition
+  // included, is always treated as conditional-with-an-implicit-fallthrough-
+  // successor, which FalseBB doesn't have (its only real successor is
+  // MergeBB) - confirmed via a real crash: MachineBlockPlacement's
+  // updateTerminator asserting isSuccessor(PreviousLayoutSuccessor) at -O1+.
+  BuildMI(FalseBB, DL, TII->get(Moe::JMP)).addMBB(MergeBB);
+
+  // OneSeed/OneReg must be distinct SSA values - INCREMENT's tied "$o = $oin"
+  // constraint needs oin to differ from the fresh result it defines (see
+  // emitMul's Bound/BoundZero comment).
+  BuildMI(TrueBB, DL, TII->get(Moe::XOR), OneSeed).addReg(AReg).addReg(AReg);
+  BuildMI(TrueBB, DL, TII->get(Moe::INCREMENT), OneReg)
+      .addReg(OneSeed)
+      .addImm(1);
+
+  BuildMI(*MergeBB, MergeBB->begin(), DL, TII->get(TargetOpcode::PHI), DstReg)
+      .addReg(ZeroReg).addMBB(FalseBB)
+      .addReg(OneReg).addMBB(TrueBB);
+
+  MI.eraseFromParent();
+  return MergeBB;
 }
 
 //===----------------------------------------------------------------------===//
