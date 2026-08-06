@@ -466,7 +466,16 @@ SDValue MoeTargetLowering::LowerFormalArguments(
     } else {
       assert(VA.isMemLoc());
       MachineFrameInfo &MFI = MF.getFrameInfo();
-      int FI = MFI.CreateFixedObject(4, VA.getLocMemOffset(), true);
+      // +4: the callee's entry SP points directly at the return address the
+      // caller's CALL sequence just pushed (POP'd only by this function's
+      // own epilogue, not by hardware) - so the first overflow-argument
+      // word the caller stored (at its own pre-push SP + offset 0) actually
+      // sits one word *above* entry SP, not at it. Confirmed by execution:
+      // without this adjustment, every stack-passed argument silently reads
+      // back the value meant for the previous overflow slot (or garbage for
+      // the very first one) - see the Milestone 6 plan's "more than 4
+      // argument words" finding.
+      int FI = MFI.CreateFixedObject(4, VA.getLocMemOffset() + 4, true);
       SDValue FIN = DAG.getFrameIndex(FI, getFrameIndexTy(DAG.getDataLayout()));
       InVals.push_back(DAG.getLoad(
           VA.getLocVT(), dl, Chain, FIN,

@@ -79,11 +79,14 @@ bool MoeRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
   // frame-index is SP-relative. MoeFrameLowering's prologue always finishes
   // adjusting SP before any frame-indexed access executes, so the object's
   // recorded offset plus the total (post-prologue) frame size is exactly
-  // its offset from the current SP - no extra fixup is needed the way
-  // hardware-CALL targets need to skip an implicitly-pushed return address,
-  // since Moe's return address is pushed explicitly by the caller (see the
-  // Milestone 1 plan's ABI section), entirely outside the callee's own
-  // frame accounting.
+  // its offset from the current SP. This formula itself needs no fixup for
+  // the return address, since it works purely in terms of whatever SPOffset
+  // a frame index was created with - but incoming stack-argument fixed
+  // objects (see LowerFormalArguments) do need a +4 baked into that
+  // SPOffset: unlike hardware-CALL targets, Moe's return address is pushed
+  // explicitly by the caller and stays on the stack until this function's
+  // own epilogue POPs it, so it still occupies the first word at entry SP,
+  // one word below where the caller's overflow arguments actually start.
   int Offset = MF.getFrameInfo().getObjectOffset(FrameIndex) +
                MF.getFrameInfo().getStackSize();
   Offset += MI.getOperand(FIOperandNum + 1).getImm();
