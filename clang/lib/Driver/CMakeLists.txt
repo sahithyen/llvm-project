@@ -72,6 +72,7 @@ add_clang_library(clangDriver
   ToolChains/MinGW.cpp
   ToolChains/MSP430.cpp
   ToolChains/MSVC.cpp
+  ToolChains/Moe.cpp
   ToolChains/NetBSD.cpp
   ToolChains/OHOS.cpp
   ToolChains/OpenBSD.cpp
