@@ -30,6 +30,21 @@ Tool *MoeToolChain::buildLinker() const {
   return new tools::moe::Linker(*this);
 }
 
+void moe::Linker::AddStartFiles(const ArgList &Args,
+                                 ArgStringList &CmdArgs) const {
+  if (Args.hasArg(options::OPT_nostartfiles, options::OPT_nostdlib))
+    return;
+  CmdArgs.push_back(Args.MakeArgString(getToolChain().GetFilePath("crt0.o")));
+}
+
+void moe::Linker::AddDefaultLibs(const ArgList &Args,
+                                  ArgStringList &CmdArgs) const {
+  if (Args.hasArg(options::OPT_nostdlib, options::OPT_nodefaultlibs))
+    return;
+  CmdArgs.push_back(
+      Args.MakeArgString(getToolChain().GetFilePath("libmoe_f32.o")));
+}
+
 void moe::Linker::ConstructJob(Compilation &C, const JobAction &JA,
                                 const InputInfo &Output,
                                 const InputInfoList &Inputs,
@@ -40,15 +55,19 @@ void moe::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   ArgStringList CmdArgs;
 
   // Matches every llvm-tests/run-*.sh script's ld.lld invocation exactly -
-  // see Moe.h's Linker comment for why nothing more (no crt0/libc
-  // auto-linking, no linker script, no --gc-sections) is added here.
+  // see Moe.h's Linker comment for why nothing more (no linker script, no
+  // --gc-sections) is added here.
   CmdArgs.push_back("--entry=_start");
   CmdArgs.push_back("-Ttext=0x0");
   CmdArgs.push_back("--image-base=0x0");
 
+  AddStartFiles(Args, CmdArgs);
+
   Args.AddAllArgs(CmdArgs, options::OPT_L);
   ToolChain.AddFilePathLibArgs(Args, CmdArgs);
   AddLinkerInputs(ToolChain, Inputs, Args, CmdArgs, JA);
+
+  AddDefaultLibs(Args, CmdArgs);
 
   CmdArgs.push_back("-o");
   CmdArgs.push_back(Output.getFilename());

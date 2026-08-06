@@ -32,7 +32,13 @@ class LLVM_LIBRARY_VISIBILITY MoeToolChain : public Generic_ELF {
 public:
   MoeToolChain(const Driver &D, const llvm::Triple &Triple,
                const llvm::opt::ArgList &Args)
-      : Generic_ELF(D, Triple, Args) {}
+      : Generic_ELF(D, Triple, Args) {
+    // Where runtime/build.sh installs crt0.o/libmoe_f32.o, relative to
+    // wherever this clang binary itself lives - not a hardcoded absolute
+    // repo path. Standard ToolChain idiom (see e.g. DragonFly's
+    // "getDriver().Dir + /../lib"); GetFilePath("crt0.o") searches this.
+    getFilePaths().push_back(D.Dir + "/../lib/moe");
+  }
 
   void addClangTargetOptions(const llvm::opt::ArgList &DriverArgs,
                              llvm::opt::ArgStringList &CC1Args,
@@ -68,9 +74,10 @@ namespace moe {
 
 // Invokes ld.lld directly with the exact flags every llvm-tests/run-*.sh
 // script already hardcodes - see the Milestone 9 plan for why: no linker
-// script, no crt0/libc auto-linking, no --gc-sections. Deliberately does
-// not productionize any of that; it just gives Clang the same manual
-// invocation this project's own test scripts already prove works.
+// script, no --gc-sections. Milestone 10 Part B added real crt0/soft-float
+// auto-linking (AddStartFiles/AddDefaultLibs, below) - everything else
+// (linker script, stack-protector args, etc.) is still deliberately not
+// productionized.
 class LLVM_LIBRARY_VISIBILITY Linker final : public Tool {
 public:
   Linker(const ToolChain &TC) : Tool("Moe::Linker", "ld.lld", TC) {}
@@ -80,6 +87,18 @@ public:
                     const InputInfo &Output, const InputInfoList &Inputs,
                     const llvm::opt::ArgList &TCArgs,
                     const char *LinkingOutput) const override;
+
+private:
+  // Adds runtime/build.sh's installed crt0.o, unless -nostartfiles/-nostdlib
+  // suppress it (matching MSP430ToolChain's precedent).
+  void AddStartFiles(const llvm::opt::ArgList &Args,
+                      llvm::opt::ArgStringList &CmdArgs) const;
+  // Adds the installed f32 soft-float runtime as a plain positional linker
+  // input (not an -l/archive - only two flat .o files exist, no need for
+  // ar/archive symbol-pulling machinery), unless -nostdlib/-nodefaultlibs
+  // suppress it.
+  void AddDefaultLibs(const llvm::opt::ArgList &Args,
+                       llvm::opt::ArgStringList &CmdArgs) const;
 };
 
 } // end namespace moe
