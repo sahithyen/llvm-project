@@ -525,15 +525,61 @@ MachineBasicBlock *MoeTargetLowering::emitCall(MachineInstr &MI,
   DebugLoc DL = MI.getDebugLoc();
   MachineFunction *MF = BB->getParent();
 
-  // A fresh local symbol marking "the address right after this call
-  // sequence" - the return address the callee jumps back to. Using a plain
-  // EH_LABEL pseudo (instead of splitting BB and referencing the new
-  // block's own label) avoids relying on a block boundary that later CFG
-  // simplification passes (block/branch folding) would just merge back
-  // away, since there's no real branch between "before" and "after" the
-  // call from their point of view - see the Milestone 1 plan's call-
-  // sequence design.
-  MCSymbol *RetSym = MF->getContext().createTempSymbol("callret", true);
+  // The call's continuation - everything that originally followed MI in BB -
+  // becomes a real MachineBasicBlock, not a mid-block EH_LABEL (Milestone
+  // 1-3's approach). See the Milestone 4 plan for the full diagnosis: with a
+  // mid-block EH_LABEL, RegAllocFast's per-block reload placement
+  // (reloadAtBegin/getMBBBeginInsertionPoint, which explicitly knows to
+  // insert reloads right after a block-leading label) never applies, since
+  // that mechanism only runs at real block boundaries. RegAllocFast instead
+  // processes each block in a single *backward* per-instruction scan
+  // (confirmed via -debug-only=regalloc) that has no notion of "this jump's
+  // fallthrough is fake, control only resumes via the callee's own jump
+  // back to a label" - it was observed placing a reload for a value needed
+  // by a *later* call right after JMPabs (the last instruction it can see),
+  // landing it in dead code before the label and silently corrupting any
+  // value that must survive from before this call to a later call's
+  // argument setup. A real block boundary lets RegAllocFast's own
+  // block-crossing liveness mechanism handle this correctly instead.
+  //
+  // Everything originally after MI - including ADJCALLSTACKUP and
+  // LowerCallResult's `%result:gpr = COPY $gp0` (reading the call's return
+  // value straight out of the physical register RetCC_Moe assigns it to) -
+  // moves into ContinueBB: none of it can stay in BB, since nothing placed
+  // in BB after JMPabs is ever actually reached (an earlier attempt at this
+  // fix tried keeping the result COPY in BB on the theory that a fresh
+  // block's physical-register live-in is disallowed pre-regalloc - it built
+  // cleanly and passed -verify-machineinstrs, but silently produced dead
+  // code for exactly the same reason as the original bug, only caught by
+  // actually executing a 3-call chain where the result has to survive to a
+  // later call - see sdiv_test.ll and the Milestone 4 plan). GP0's live-in
+  // below does trip MachineVerifier's "allocatable live-in but isn't entry/
+  // landing-pad" check while still in SSA form (pre-PHI-elimination) - that
+  // check is gated off once the function leaves SSA form
+  // (MF->getProperties().hasNoPHIs(), see MachineVerifier.cpp), and no
+  // later pass in this pipeline (phi-elimination, two-address, RegAllocFast
+  // itself) actually depends on the invariant it's protecting for a block
+  // with no PHIs of its own to confuse - confirmed by execution, not just
+  // by satisfying the verifier at one intermediate stage.
+  const BasicBlock *LLVM_BB = BB->getBasicBlock();
+  MachineFunction::iterator InsertPt = ++BB->getIterator();
+  MachineBasicBlock *ContinueBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MF->insert(InsertPt, ContinueBB);
+  ContinueBB->splice(ContinueBB->begin(), BB,
+                      std::next(MachineBasicBlock::iterator(MI)), BB->end());
+  ContinueBB->transferSuccessorsAndUpdatePHIs(BB);
+  BB->addSuccessor(ContinueBB);
+  ContinueBB->addLiveIn(Moe::GP0);
+
+  // ContinueBB has exactly one predecessor (BB) and is reached purely by
+  // fallthrough from the AsmPrinter's point of view (JMPabs is deliberately
+  // not a terminator - see JMPabs's own def comment), so
+  // shouldEmitLabelForBasicBlock would normally skip emitting its label
+  // entirely. Force it: the callee's return sequence jumps to this exact
+  // address, so the label must exist in the final assembly even though
+  // nothing else branches to it.
+  ContinueBB->setLabelMustBeEmitted();
+  MCSymbol *RetSym = ContinueBB->getSymbol();
 
   // LOADabs always dereferences its trailing address operand (loads
   // memory[addr], not addr itself - see the spec's LOAD section), so getting
@@ -544,7 +590,8 @@ MachineBasicBlock *MoeTargetLowering::emitCall(MachineInstr &MI,
   MoeConstantPoolValue *CPV = MoeConstantPoolValue::Create(PtrTy, RetSym);
   unsigned CPIdx = MF->getConstantPool()->getConstantPoolIndex(CPV, Align(4));
 
-  // LOAD.W [pool entry containing RetSym] -> GP4 ; PUSH.W GP4 ; JUMP.AL [callee] ; RetSym:
+  // LOAD.W [pool entry containing RetSym] -> GP4 ; PUSH.W GP4 ; JUMP.AL [callee]
+  // ; ContinueBB (RetSym):
   BuildMI(*BB, MI, DL, TII->get(Moe::LOADabs), Moe::GP4)
       .addConstantPoolIndex(CPIdx);
   BuildMI(*BB, MI, DL, TII->get(Moe::PUSH)).addReg(Moe::GP4, RegState::Kill);
@@ -554,10 +601,18 @@ MachineBasicBlock *MoeTargetLowering::emitCall(MachineInstr &MI,
   // attached to the pseudo, so they stay live across the expansion.
   for (unsigned i = 1, e = MI.getNumOperands(); i != e; ++i)
     MIB.add(MI.getOperand(i));
-  BuildMI(*BB, MI, DL, TII->get(TargetOpcode::EH_LABEL)).addSym(RetSym);
+  // Every call defines GP0 (RetCC_Moe assigns every i32 return there,
+  // unconditionally - even a void call's callee still executes a RET that
+  // restores GP0 to *some* value), but nothing on this pseudo said so before
+  // now: LowerCallResult's `COPY $gp0` right after the call relied on GP0
+  // merely *looking* defined from an earlier argument load (the verifier's
+  // linear scan doesn't know the call clobbers it in between) - which broke
+  // for a zero-argument call, where GP0 was never touched at all before the
+  // read. Declaring the real semantic fact directly fixes both cases.
+  MIB.addReg(Moe::GP0, RegState::ImplicitDefine);
 
   MI.eraseFromParent();
-  return BB;
+  return ContinueBB;
 }
 
 //===----------------------------------------------------------------------===//
