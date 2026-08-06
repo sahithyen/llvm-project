@@ -569,9 +569,16 @@ SDValue MoeTargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
   }
 
   // Direct calls only for Milestone 1 - turn the callee into a
-  // TargetGlobalAddress so legalize doesn't try to touch it.
+  // TargetGlobalAddress so legalize doesn't try to touch it. A libcall (e.g.
+  // the soft-float runtime's __addsf3, emitted automatically by the generic
+  // float-softening legalizer - see the Milestone 8 plan) has an
+  // ExternalSymbolSDNode callee instead, referenced by name rather than by
+  // GlobalValue*, since the calling module never defines it - same
+  // TargetExternalSymbol treatment.
   if (auto *G = dyn_cast<GlobalAddressSDNode>(Callee))
     Callee = DAG.getTargetGlobalAddress(G->getGlobal(), dl, MVT::i32);
+  else if (auto *ES = dyn_cast<ExternalSymbolSDNode>(Callee))
+    Callee = DAG.getTargetExternalSymbol(ES->getSymbol(), MVT::i32);
   else
     report_fatal_error("Moe: only direct calls are supported (Milestone 1)");
 

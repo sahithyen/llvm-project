@@ -75,6 +75,13 @@ void MoeMCInstLower::Lower(const MachineInstr *MI, MCInst &OutMI) const {
     case MachineOperand::MO_GlobalAddress:
       MCOp = LowerSymbolOperand(MO, GetGlobalAddressSymbol(MO));
       break;
+    case MachineOperand::MO_ExternalSymbol:
+      // A libcall's callee (e.g. __addsf3, referenced by name rather than a
+      // GlobalValue* - see LowerCall's matching ExternalSymbolSDNode case
+      // and the Milestone 8 plan).
+      MCOp = LowerSymbolOperand(
+          MO, Printer.GetExternalSymbolSymbol(MO.getSymbolName()));
+      break;
     case MachineOperand::MO_ConstantPoolIndex:
       MCOp = LowerSymbolOperand(MO, GetConstantPoolIndexSymbol(MO));
       break;

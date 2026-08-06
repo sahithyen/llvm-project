@@ -107,6 +107,13 @@ let isCall = 1, usesCustomInserter = 1, Uses = [SP], Defs = [SP] in
 def CALL : MoePseudo<(outs), (ins calltarget:$callee), "#CALL $callee",
                       [(Moecall tglobaladdr:$callee)]>;
 
+// A libcall (e.g. the soft-float runtime's __addsf3, emitted automatically
+// by the generic float-softening legalizer - see the Milestone 8 plan) is
+// referenced by an external-symbol name rather than a GlobalValue*, so its
+// callee is a TargetExternalSymbol node instead of TargetGlobalAddress -
+// same CALL pseudo, alternate callee-matching pattern.
+def : Pat<(Moecall texternalsym:$callee), (CALL texternalsym:$callee)>;
+
 // Expanded by MoeInstrInfo::expandPostRAPseudo (NOT a custom inserter -
 // this pseudo must still look like a real `isReturn` terminator when
 // PrologEpilogInserter runs, so it knows this block needs an epilogue;
