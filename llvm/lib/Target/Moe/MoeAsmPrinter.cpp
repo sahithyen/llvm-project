@@ -45,9 +45,42 @@ public:
   void emitInstruction(const MachineInstr *MI) override;
   void emitMachineConstantPoolValue(MachineConstantPoolValue *MCPV) override;
 
+  // Inline asm (Milestone 15): AsmPrinter::PrintAsmOperand's default
+  // (no-ExtraCode) implementation unconditionally fails ("Targets should
+  // override this" - see its own comment) - every target that supports
+  // inline asm needs this, modeled directly on MSP430AsmPrinter's
+  // identically-shaped override. Register operands only, matching
+  // MoeTargetLowering::getRegForInlineAsmConstraint's "r"-only scope.
+  bool PrintAsmOperand(const MachineInstr *MI, unsigned OpNo,
+                       const char *ExtraCode, raw_ostream &O) override;
+  void printOperand(const MachineInstr *MI, unsigned OpNo, raw_ostream &O);
+
   static char ID;
 };
 } // end anonymous namespace
+
+bool MoeAsmPrinter::PrintAsmOperand(const MachineInstr *MI, unsigned OpNo,
+                                     const char *ExtraCode, raw_ostream &O) {
+  if (ExtraCode && ExtraCode[0])
+    return AsmPrinter::PrintAsmOperand(MI, OpNo, ExtraCode, O);
+  printOperand(MI, OpNo, O);
+  return false;
+}
+
+void MoeAsmPrinter::printOperand(const MachineInstr *MI, unsigned OpNo,
+                                  raw_ostream &O) {
+  const MachineOperand &MO = MI->getOperand(OpNo);
+  switch (MO.getType()) {
+  case MachineOperand::MO_Register:
+    O << MoeInstPrinter::getRegisterName(MO.getReg());
+    break;
+  case MachineOperand::MO_Immediate:
+    O << MO.getImm();
+    break;
+  default:
+    llvm_unreachable("unexpected inline asm operand kind");
+  }
+}
 
 void MoeAsmPrinter::emitFunctionBodyStart() {
   // The encoder tracks each function's running byte offset (to know when a

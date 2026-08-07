@@ -534,6 +534,45 @@ SDValue MoeTargetLowering::LowerSREM(SDValue Op, SelectionDAG &DAG) const {
 }
 
 //===----------------------------------------------------------------------===//
+// Inline asm (Milestone 15) - only "r" (any GP register), modeled directly
+// on MSP430TargetLowering's identically-shaped implementation. clang's
+// generic TargetInfo::validateAsmConstraint already recognizes 'r'
+// universally before ever reaching Moe's own (always-false) override - see
+// clang/lib/Basic/TargetInfo.cpp - so no clang-side change was needed,
+// confirmed empirically: compiling real inline-asm C reached this backend
+// code, failing only with "couldn't allocate output register for
+// constraint 'r'" until these two overrides existed.
+//===----------------------------------------------------------------------===//
+
+TargetLowering::ConstraintType
+MoeTargetLowering::getConstraintType(StringRef Constraint) const {
+  if (Constraint.size() == 1) {
+    switch (Constraint[0]) {
+    case 'r':
+      return C_RegisterClass;
+    default:
+      break;
+    }
+  }
+  return TargetLowering::getConstraintType(Constraint);
+}
+
+std::pair<unsigned, const TargetRegisterClass *>
+MoeTargetLowering::getRegForInlineAsmConstraint(const TargetRegisterInfo *TRI,
+                                                 StringRef Constraint,
+                                                 MVT VT) const {
+  if (Constraint.size() == 1) {
+    switch (Constraint[0]) {
+    case 'r':
+      return std::make_pair(0U, &Moe::GPRRegClass);
+    default:
+      break;
+    }
+  }
+  return TargetLowering::getRegForInlineAsmConstraint(TRI, Constraint, VT);
+}
+
+//===----------------------------------------------------------------------===//
 // Calling convention (see MoeCallingConv.td and the Milestone 1 plan's ABI
 // section: GP0-3 args/caller-saved, GP0 also the return value, GP4-5
 // reserved scratch, GP6-7 callee-saved).
