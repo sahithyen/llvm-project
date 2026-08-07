@@ -49,6 +49,10 @@ void moe::Linker::AddDefaultLibs(const ArgList &Args,
   // here, both are always present together).
   CmdArgs.push_back(
       Args.MakeArgString(getToolChain().GetFilePath("libmoe_i64.o")));
+  // memcpy/memset (Milestone 13) - clang implicitly emits calls to these for
+  // things as ordinary as a large struct assignment, see runtime/memcpy.ll.
+  CmdArgs.push_back(
+      Args.MakeArgString(getToolChain().GetFilePath("libmoe_memcpy.o")));
 }
 
 void moe::Linker::ConstructJob(Compilation &C, const JobAction &JA,
