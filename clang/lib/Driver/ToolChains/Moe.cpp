@@ -58,6 +58,16 @@ void moe::Linker::AddDefaultLibs(const ArgList &Args,
   // variable-shift libcalls (libmoe_i64.o), both always present alongside.
   CmdArgs.push_back(
       Args.MakeArgString(getToolChain().GetFilePath("libmoe_f64.o")));
+  // Minimal libc (Milestone 19) - malloc/free/calloc (runtime/malloc.ll),
+  // strlen/strcpy/strcmp/etc (runtime/string.ll), putchar/puts
+  // (runtime/stdio.ll, depends on strlen). No real system libc exists for
+  // this freestanding target - these are it.
+  CmdArgs.push_back(
+      Args.MakeArgString(getToolChain().GetFilePath("libmoe_malloc.o")));
+  CmdArgs.push_back(
+      Args.MakeArgString(getToolChain().GetFilePath("libmoe_string.o")));
+  CmdArgs.push_back(
+      Args.MakeArgString(getToolChain().GetFilePath("libmoe_stdio.o")));
 }
 
 void moe::Linker::ConstructJob(Compilation &C, const JobAction &JA,
