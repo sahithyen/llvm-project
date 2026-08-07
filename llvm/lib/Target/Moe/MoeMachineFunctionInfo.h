@@ -26,6 +26,12 @@ class MoeMachineFunctionInfo : public MachineFunctionInfo {
   /// MoeRegisterInfo::eliminateFrameIndex.
   unsigned CalleeSavedFrameSize = 0;
 
+  /// Frame index of the variadic-argument register-save area (Milestone 14)
+  /// - see LowerFormalArguments's isVarArg block and LowerVASTART. -1 if
+  /// this function isn't variadic or consumed all 4 argument registers with
+  /// named parameters (nothing to save).
+  int VarArgsFrameIndex = -1;
+
 public:
   MoeMachineFunctionInfo() = default;
   MoeMachineFunctionInfo(const Function &F, const TargetSubtargetInfo *STI) {}
@@ -37,6 +43,9 @@ public:
 
   unsigned getCalleeSavedFrameSize() const { return CalleeSavedFrameSize; }
   void setCalleeSavedFrameSize(unsigned Bytes) { CalleeSavedFrameSize = Bytes; }
+
+  int getVarArgsFrameIndex() const { return VarArgsFrameIndex; }
+  void setVarArgsFrameIndex(int FI) { VarArgsFrameIndex = FI; }
 };
 
 } // end namespace llvm

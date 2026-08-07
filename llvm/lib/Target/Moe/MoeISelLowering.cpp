@@ -122,6 +122,25 @@ MoeTargetLowering::MoeTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::STACKSAVE, MVT::Other, Expand);
   setOperationAction(ISD::STACKRESTORE, MVT::Other, Expand);
 
+  // Variadic functions (Milestone 14): getBuiltinVaListKind is
+  // CharPtrBuiltinVaList (clang/lib/Basic/Targets/Moe.h) - va_list is just a
+  // char*, but that model still routes va_start/va_arg through real
+  // ISD::VASTART/ISD::VAARG nodes (confirmed empirically: -S -emit-llvm on a
+  // real variadic function shows llvm.va_start/a genuine `va_arg`
+  // instruction, not something clang's frontend expands away on its own).
+  // VASTART needs Custom (LowerVASTART, writing the register-save area's
+  // address - see LowerFormalArguments's isVarArg block); VAARG needs only
+  // the fully generic Expand (plain pointer-walking, natural type-size
+  // increments, no padding), not a real Custom lowering of its own - Moe has
+  // no type needing more than 4-byte alignment as a variadic argument
+  // (datalayout bakes i64 in at i64:32, matching the DoubleWidth=32
+  // TargetInfo collapse), unlike e.g. Sparc's VAARG Custom-lowering, needed
+  // there only for 8-byte-aligned doubles.
+  setOperationAction(ISD::VASTART, MVT::Other, Custom);
+  setOperationAction(ISD::VAARG, MVT::Other, Expand);
+  // va_end is a no-op for a plain-pointer va_list (nothing to release).
+  setOperationAction(ISD::VAEND, MVT::Other, Expand);
+
   // A Byte/Halfword-size LOAD only overwrites the selected lane of its
   // destination register - the rest keeps its prior value (see 'Handling
   // words, halfwords and bytes' in the Encoding chapter) - unlike most RISC
@@ -169,6 +188,8 @@ SDValue MoeTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
     return LowerSETCC(Op, DAG);
   case ISD::SELECT_CC:
     return LowerSELECT_CC(Op, DAG);
+  case ISD::VASTART:
+    return LowerVASTART(Op, DAG);
   case ISD::MUL:
     return LowerMUL(Op, DAG);
   case ISD::UDIV:
@@ -555,7 +576,79 @@ SDValue MoeTargetLowering::LowerFormalArguments(
     }
   }
 
+  // Variadic functions (Milestone 14): spill whichever of GP0-3 named
+  // arguments didn't consume into a register-save area, so va_arg's fully
+  // generic pointer-walking expansion (see the VASTART/VAARG
+  // setOperationAction comment above) can read them contiguously starting
+  // from LowerVASTART's initial pointer.
+  //
+  // Deliberate, documented scope cut: this only covers the up-to-4-total-
+  // arguments case (named + variadic together) - real overflow variadic
+  // arguments (a 5th+ total argument, stack-passed by LowerCall's existing,
+  // unmodified convention) are NOT reachable by continuing to walk past the
+  // register-save area. Making that work would need the register-save area
+  // and the stack-passed-overflow area to be memory-contiguous, but Moe's
+  // entry SP points directly at the just-pushed return address (unlike e.g.
+  // Sparc's register-window ABI, which reserves fixed, args-independent
+  // stack space for every possible register argument) - the return address
+  // occupies exactly the 4 bytes that would need to sit between the two
+  // areas, and there is no way to skip over it with a plain, uniform
+  // pointer-plus-size VAARG expansion. Solving this needs real ABI work
+  // (e.g. always stack-passing variadic arguments), out of scope here - a
+  // variadic function called with more than 4 total arguments will read
+  // back garbage for the 5th and later, not silently or loudly fail.
+  if (isVarArg) {
+    static const MCPhysReg ArgRegs[] = {Moe::GP0, Moe::GP1, Moe::GP2,
+                                         Moe::GP3};
+    unsigned NumConsumed = CCInfo.getFirstUnallocated(ArgRegs);
+    unsigned NumToSave = 4 - NumConsumed;
+
+    // Always create this (even a 0-size object, if every register was
+    // consumed by named parameters) so LowerVASTART always has a valid
+    // frame index to reference - a variadic function is always a valid
+    // va_start target regardless of how many named parameters it declares.
+    MachineFrameInfo &MFI = MF.getFrameInfo();
+    int VarArgsFI = MFI.CreateStackObject(4 * NumToSave, Align(4), false);
+    MF.getInfo<MoeMachineFunctionInfo>()->setVarArgsFrameIndex(VarArgsFI);
+
+    if (NumToSave > 0) {
+      SmallVector<SDValue, 4> OutChains;
+      for (unsigned i = NumConsumed; i != 4; ++i) {
+        Register VReg = RegInfo.createVirtualRegister(&Moe::GPRRegClass);
+        RegInfo.addLiveIn(ArgRegs[i], VReg);
+        SDValue ArgValue = DAG.getCopyFromReg(Chain, dl, VReg, MVT::i32);
+
+        SDValue FIN = DAG.getFrameIndex(VarArgsFI,
+                                         getFrameIndexTy(DAG.getDataLayout()));
+        SDValue Offset =
+            DAG.getNode(ISD::ADD, dl, getFrameIndexTy(DAG.getDataLayout()),
+                        FIN, DAG.getIntPtrConstant(4 * (i - NumConsumed), dl));
+        OutChains.push_back(
+            DAG.getStore(Chain, dl, ArgValue, Offset, MachinePointerInfo()));
+      }
+      Chain = DAG.getNode(ISD::TokenFactor, dl, MVT::Other, OutChains);
+    }
+  }
+
   return Chain;
+}
+
+// va_start just stores the register-save area's address (a real FrameIndex
+// value, resolved to a genuine SP-relative address the same way FIADDR
+// already handles "a stack object's address as a value" - see the
+// Milestone 7 plan - not a frame-pointer-plus-offset computation like
+// Sparc's LowerVASTART, since Moe has no frame pointer at all) into the
+// va_list slot.
+SDValue MoeTargetLowering::LowerVASTART(SDValue Op, SelectionDAG &DAG) const {
+  MachineFunction &MF = DAG.getMachineFunction();
+  MoeMachineFunctionInfo *FuncInfo = MF.getInfo<MoeMachineFunctionInfo>();
+  SDLoc dl(Op);
+
+  int VarArgsFI = FuncInfo->getVarArgsFrameIndex();
+  SDValue FIN = DAG.getFrameIndex(VarArgsFI, getFrameIndexTy(DAG.getDataLayout()));
+  const Value *SV = cast<SrcValueSDNode>(Op.getOperand(2))->getValue();
+  return DAG.getStore(Op.getOperand(0), dl, FIN, Op.getOperand(1),
+                       MachinePointerInfo(SV));
 }
 
 bool MoeTargetLowering::CanLowerReturn(

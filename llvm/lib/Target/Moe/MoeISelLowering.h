@@ -54,6 +54,7 @@ public:
   SDValue LowerSDIV(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerSREM(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerExtLoad(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerVASTART(SDValue Op, SelectionDAG &DAG) const;
 
   MachineBasicBlock *
   EmitInstrWithCustomInserter(MachineInstr &MI,
