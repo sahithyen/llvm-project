@@ -64,12 +64,17 @@ void moe::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   std::string Linker = ToolChain.GetProgramPath(getShortName());
   ArgStringList CmdArgs;
 
-  // Matches every llvm-tests/run-*.sh script's ld.lld invocation exactly -
-  // see Moe.h's Linker comment for why nothing more (no linker script, no
-  // --gc-sections) is added here.
-  CmdArgs.push_back("--entry=_start");
-  CmdArgs.push_back("-Ttext=0x0");
-  CmdArgs.push_back("--image-base=0x0");
+  // Milestone 16: an explicit linker script (runtime/moe.ld) replaces the
+  // previous bare -Ttext=0x0 --image-base=0x0 (relying on ld.lld's default
+  // script) - formalizes the same RAM-at-0x0 layout explicitly, and defines
+  // __bss_start/_end directly instead of leaving them to whatever ld.lld's
+  // default happens to do with no real SECTIONS description (see
+  // Milestone 10 Part B's crt0 bss-anchor fix for the class of bug that
+  // caused - this closes it more robustly, at the linker-script level
+  // rather than only working around it from the runtime side). ENTRY(_start)
+  // lives in the script itself, so no separate --entry flag is needed.
+  CmdArgs.push_back("-T");
+  CmdArgs.push_back(Args.MakeArgString(getToolChain().GetFilePath("moe.ld")));
 
   AddStartFiles(Args, CmdArgs);
 
