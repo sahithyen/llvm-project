@@ -63,6 +63,19 @@ MoeTargetLowering::MoeTargetLowering(const TargetMachine &TM,
   // (LowerSETCC/emitSetCC), not a single instruction.
   setOperationAction(ISD::SETCC, MVT::i32, Custom);
 
+  // No flag-testing SELECT instruction either (same reason as BR_CC/SETCC
+  // above). Needed for i64 relational comparisons (Milestone 12): the
+  // generic i64 legalizer's compare-by-parts expansion (compare high words;
+  // if equal, compare low words) combines the two results via SELECT_CC,
+  // which otherwise survives all the way to instruction selection with no
+  // lowering and crashes ("Cannot select: ... = select_cc"). Custom (a real
+  // SETCCPSEUDO-shaped branchy sequence - see LowerSELECT_CC/emitSelectCC),
+  // not Expand: LegalizeDAG asserts Expand'ing SELECT_CC requires SELECT to
+  // NOT also be Expand (its generic Expand implementation lowers through
+  // SELECT as an intermediate step), and Moe has no SELECT lowering of its
+  // own to fall back to either.
+  setOperationAction(ISD::SELECT_CC, MVT::i32, Custom);
+
   // SHIFT moves exactly one bit per instruction - see MoeISelLowering::
   // LowerShifts and the Milestone 1 plan's SHIFT notes. Variable-amount
   // shifts are out of scope for Milestone 1.
@@ -80,6 +93,30 @@ MoeTargetLowering::MoeTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::UDIV, MVT::i32, Custom);
   setOperationAction(ISD::SREM, MVT::i32, Custom);
   setOperationAction(ISD::UREM, MVT::i32, Custom);
+
+  // i64 arithmetic (Milestone 12): add/sub/udiv/urem/sdiv/srem/icmp/zext/
+  // sext/trunc all already work via the generic i64-from-i32-halves
+  // legalizer's pure-i32 expansion now that real SETCC/SELECT_CC exist
+  // (Milestone 11 above) - confirmed empirically, no action needed for any
+  // of them. MUL and variable-amount shifts don't: no hardware or
+  // software-loop-based wide-multiply/parts-shift primitive exists (or ever
+  // will - see runtime/i64.ll's __muldi3/__ashldi3/__lshrdi3/__ashrdi3), so
+  // explicitly Expand the primitives the generic legalizer tries first
+  // (UMUL_LOHI etc, SHL_PARTS etc) so it falls through to the standard
+  // compiler-rt RTLIB names instead of leaving them unhandled through to
+  // instruction selection, which crashes ("Cannot select: ... =
+  // umul_lohi"/"shl_parts").
+  setOperationAction(ISD::MUL, MVT::i64, Expand);
+  setOperationAction(ISD::SMUL_LOHI, MVT::i32, Expand);
+  setOperationAction(ISD::UMUL_LOHI, MVT::i32, Expand);
+  setOperationAction(ISD::MULHS, MVT::i32, Expand);
+  setOperationAction(ISD::MULHU, MVT::i32, Expand);
+  setOperationAction(ISD::SHL, MVT::i64, Expand);
+  setOperationAction(ISD::SRL, MVT::i64, Expand);
+  setOperationAction(ISD::SRA, MVT::i64, Expand);
+  setOperationAction(ISD::SHL_PARTS, MVT::i32, Expand);
+  setOperationAction(ISD::SRL_PARTS, MVT::i32, Expand);
+  setOperationAction(ISD::SRA_PARTS, MVT::i32, Expand);
 
   setOperationAction(ISD::DYNAMIC_STACKALLOC, MVT::i32, Expand);
   setOperationAction(ISD::STACKSAVE, MVT::Other, Expand);
@@ -130,6 +167,8 @@ SDValue MoeTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
     return LowerBR_CC(Op, DAG);
   case ISD::SETCC:
     return LowerSETCC(Op, DAG);
+  case ISD::SELECT_CC:
+    return LowerSELECT_CC(Op, DAG);
   case ISD::MUL:
     return LowerMUL(Op, DAG);
   case ISD::UDIV:
@@ -392,6 +431,24 @@ SDValue MoeTargetLowering::LowerSETCC(SDValue Op, SelectionDAG &DAG) const {
   return SDValue(
       DAG.getMachineNode(Moe::SETCCPSEUDO, dl, MVT::i32, LHS, RHS, TargetCC),
       0);
+}
+
+// Constructs SELECTCCPSEUDO directly as a machine node (bypassing
+// SelectionDAG pattern matching, same as LowerSETCC/LowerMUL) - emitSelectCC
+// expands it into the same SUBcmp+JCC branchy sequence as emitSetCC, merging
+// True/False operands instead of hardcoded 0/1. See SELECTCCPSEUDO's def
+// comment in MoeInstrInfo.td.
+SDValue MoeTargetLowering::LowerSELECT_CC(SDValue Op, SelectionDAG &DAG) const {
+  SDLoc dl(Op);
+  SDValue LHS = Op.getOperand(0);
+  SDValue RHS = Op.getOperand(1);
+  SDValue True = Op.getOperand(2);
+  SDValue False = Op.getOperand(3);
+  ISD::CondCode CC = cast<CondCodeSDNode>(Op.getOperand(4))->get();
+  SDValue TargetCC = DAG.getTargetConstant(getMoeCondCode(CC), dl, MVT::i32);
+  SDValue Ops[] = {LHS, RHS, True, False, TargetCC};
+  return SDValue(
+      DAG.getMachineNode(Moe::SELECTCCPSEUDO, dl, MVT::i32, Ops), 0);
 }
 
 //===----------------------------------------------------------------------===//
@@ -665,6 +722,8 @@ MoeTargetLowering::EmitInstrWithCustomInserter(MachineInstr &MI,
     return emitVarShift(MI, BB);
   case Moe::SETCCPSEUDO:
     return emitSetCC(MI, BB);
+  case Moe::SELECTCCPSEUDO:
+    return emitSelectCC(MI, BB);
   default:
     llvm_unreachable("Unexpected instr type to insert");
   }
@@ -1425,6 +1484,60 @@ MachineBasicBlock *MoeTargetLowering::emitSetCC(MachineInstr &MI,
   BuildMI(*MergeBB, MergeBB->begin(), DL, TII->get(TargetOpcode::PHI), DstReg)
       .addReg(ZeroReg).addMBB(FalseBB)
       .addReg(OneReg).addMBB(TrueBB);
+
+  MI.eraseFromParent();
+  return MergeBB;
+}
+
+//===----------------------------------------------------------------------===//
+// Value-producing select-on-compare (Milestone 12) - see SELECTCCPSEUDO's
+// def comment in MoeInstrInfo.td. Same shape as emitSetCC, simplified: no
+// value needs computing in TrueBB/FalseBB (True/False are already-available
+// operands), so both are empty except their terminator - just enough to give
+// the PHI two distinct predecessor edges to merge through.
+//===----------------------------------------------------------------------===//
+
+MachineBasicBlock *MoeTargetLowering::emitSelectCC(MachineInstr &MI,
+                                                    MachineBasicBlock *BB) const {
+  const TargetInstrInfo *TII = BB->getParent()->getSubtarget().getInstrInfo();
+  DebugLoc DL = MI.getDebugLoc();
+  MachineFunction *MF = BB->getParent();
+
+  Register DstReg = MI.getOperand(0).getReg();
+  Register AReg = MI.getOperand(1).getReg();
+  Register BReg = MI.getOperand(2).getReg();
+  Register TrueReg = MI.getOperand(3).getReg();
+  Register FalseReg = MI.getOperand(4).getReg();
+  int64_t Cond = MI.getOperand(5).getImm();
+
+  const BasicBlock *LLVM_BB = BB->getBasicBlock();
+  MachineFunction::iterator InsertPt = ++BB->getIterator();
+  // Same insertion-order/fallthrough convention as emitSetCC.
+  MachineBasicBlock *FalseBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *TrueBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *MergeBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MF->insert(InsertPt, FalseBB);
+  MF->insert(InsertPt, TrueBB);
+  MF->insert(InsertPt, MergeBB);
+
+  MergeBB->splice(MergeBB->begin(), BB,
+                   std::next(MachineBasicBlock::iterator(MI)), BB->end());
+  MergeBB->transferSuccessorsAndUpdatePHIs(BB);
+
+  BB->addSuccessor(TrueBB);   // condition holds
+  BB->addSuccessor(FalseBB);  // condition doesn't hold: fall through
+  FalseBB->addSuccessor(MergeBB);
+  TrueBB->addSuccessor(MergeBB);
+
+  BuildMI(*BB, BB->end(), DL, TII->get(Moe::SUBcmp)).addReg(AReg).addReg(BReg);
+  BuildMI(*BB, BB->end(), DL, TII->get(Moe::JCC)).addMBB(TrueBB).addImm(Cond);
+
+  // Real Moe::JMP, not JCC+COND_AL - see emitSetCC's identical comment.
+  BuildMI(FalseBB, DL, TII->get(Moe::JMP)).addMBB(MergeBB);
+
+  BuildMI(*MergeBB, MergeBB->begin(), DL, TII->get(TargetOpcode::PHI), DstReg)
+      .addReg(FalseReg).addMBB(FalseBB)
+      .addReg(TrueReg).addMBB(TrueBB);
 
   MI.eraseFromParent();
   return MergeBB;

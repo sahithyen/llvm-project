@@ -43,6 +43,12 @@ void moe::Linker::AddDefaultLibs(const ArgList &Args,
     return;
   CmdArgs.push_back(
       Args.MakeArgString(getToolChain().GetFilePath("libmoe_f32.o")));
+  // The i64 arithmetic runtime (Milestone 12) - __muldi3/__udivdi3/etc, see
+  // runtime/i64.ll. Also depends on widemul, defined in libmoe_f32.o above
+  // (ld.lld resolves cross-object references regardless of link-line order
+  // here, both are always present together).
+  CmdArgs.push_back(
+      Args.MakeArgString(getToolChain().GetFilePath("libmoe_i64.o")));
 }
 
 void moe::Linker::ConstructJob(Compilation &C, const JobAction &JA,

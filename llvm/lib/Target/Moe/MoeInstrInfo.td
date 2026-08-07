@@ -174,6 +174,17 @@ let usesCustomInserter = 1 in
 def SETCCPSEUDO : MoePseudo<(outs GPR:$dst), (ins GPR:$a, GPR:$b, i32imm:$cond),
                              "#SETCC $dst, $a, $b, $cond", []>;
 
+// Value-producing select-on-compare (Milestone 12): needed by the generic
+// i64-from-i32-halves legalizer's relational-compare expansion (compare
+// high words; if equal, compare low words; SELECT_CC combines the two
+// results) - see LowerSELECT_CC/emitSelectCC. Same shape as SETCCPSEUDO
+// (SUBcmp+JCC+merge-by-PHI), generalized to merge two arbitrary operands
+// ($t/$f) instead of hardcoded 0/1.
+let usesCustomInserter = 1 in
+def SELECTCCPSEUDO : MoePseudo<(outs GPR:$dst),
+                                (ins GPR:$a, GPR:$b, GPR:$t, GPR:$f, i32imm:$cond),
+                                "#SELECTCC $dst, $a, $b, $t, $f, $cond", []>;
+
 // Software variable-amount shift (see the report_fatal_error this replaces in
 // MoeISelLowering::LowerShifts): SHIFT moves exactly one bit per instruction
 // with no shift-count field, so a shift by a runtime-computed amount needs a
