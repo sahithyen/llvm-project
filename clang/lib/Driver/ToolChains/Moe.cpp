@@ -53,6 +53,11 @@ void moe::Linker::AddDefaultLibs(const ArgList &Args,
   // things as ordinary as a large struct assignment, see runtime/memcpy.ll.
   CmdArgs.push_back(
       Args.MakeArgString(getToolChain().GetFilePath("libmoe_memcpy.o")));
+  // The f64/double arithmetic runtime (Milestone 18) - __adddf3/__muldf3/etc,
+  // see runtime/f64.ll. Also depends on widemul (libmoe_f32.o) and the
+  // variable-shift libcalls (libmoe_i64.o), both always present alongside.
+  CmdArgs.push_back(
+      Args.MakeArgString(getToolChain().GetFilePath("libmoe_f64.o")));
 }
 
 void moe::Linker::ConstructJob(Compilation &C, const JobAction &JA,

@@ -43,20 +43,27 @@ public:
 
     FloatWidth = 32;
     FloatAlign = 32;
-    // No f64 soft-float runtime exists (llvm-tests/softfloat_f32.ll is
-    // deliberately f32-only). Collapse double/long double onto float's
-    // IEEE-single representation, matching AVR-GCC's own -mdouble=32
-    // default for targets without hardware/software double-precision
-    // support - and matching llvm/lib/TargetParser/TargetDataLayout.cpp's
-    // pre-existing `case Triple::moe:` datalayout string, which already
-    // bakes in f64:32. This is higher-value than it might look: an
-    // unsuffixed float literal like `3.14` is `double` by default in C.
-    DoubleWidth = 32;
+    // Milestone 18: real IEEE754 binary64 double, backed by runtime/f64.ll's soft-double
+    // library (see that file's header for the full story). Before this, DoubleFormat was
+    // IEEEsingle() - collapsing every C `double` onto float's representation, matching
+    // AVR-GCC's own -mdouble=32 default - which silently miscompiled any code assuming real
+    // double precision (an unsuffixed float literal like `3.14` is `double` by default in
+    // C), not merely omitted it: it compiled cleanly and ran, just with ~7 significant
+    // decimal digits and a +-38 exponent range instead of ~15-17 digits and +-308. 32-bit
+    // alignment (not the natural 64) matches LongLongAlign above and
+    // llvm/lib/TargetParser/TargetDataLayout.cpp's pre-existing `case Triple::moe:`
+    // datalayout string's `f64:32` - no register here is wider than 32 bits regardless of a
+    // value's own type width, so nothing wider than a word is ever natively aligned (see that
+    // datalayout case's own comment). `long double` is collapsed onto `double` (both
+    // IEEEdouble()) rather than given a distinct wider format, matching this project's
+    // general preference for the simplest option that satisfies the C standard's
+    // sizeof(long double) >= sizeof(double) requirement over a third, unused, precision tier.
+    DoubleWidth = 64;
     DoubleAlign = 32;
-    DoubleFormat = &llvm::APFloat::IEEEsingle();
-    LongDoubleWidth = 32;
+    DoubleFormat = &llvm::APFloat::IEEEdouble();
+    LongDoubleWidth = 64;
     LongDoubleAlign = 32;
-    LongDoubleFormat = &llvm::APFloat::IEEEsingle();
+    LongDoubleFormat = &llvm::APFloat::IEEEdouble();
 
     SizeType = UnsignedInt;
     PtrDiffType = SignedInt;

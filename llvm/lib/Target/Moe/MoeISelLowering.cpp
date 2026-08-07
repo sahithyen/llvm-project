@@ -914,13 +914,13 @@ MachineBasicBlock *MoeTargetLowering::emitCall(MachineInstr &MI,
   ContinueBB->transferSuccessorsAndUpdatePHIs(BB);
   BB->addSuccessor(ContinueBB);
 
-  // Only declare GP0 live-in here if this call's return value is actually
+  // Only declare GP0 live-in here if THIS call's return value is actually
   // consumed - i.e. ContinueBB (just spliced in above) contains
-  // LowerCallResult's `COPY $gp0` reading it. A call whose LLVM-level
-  // return type is void, or was demoted to a hidden sret pointer (see the
-  // Milestone 7 plan's multi-field-struct-return finding), has no such
-  // COPY - and unconditionally marking GP0 live-in regardless (this
-  // function's original Milestone 4 behavior) collides with
+  // LowerCallResult's `COPY $gp0` reading it, before any OTHER call. A call
+  // whose LLVM-level return type is void, or was demoted to a hidden sret
+  // pointer (see the Milestone 7 plan's multi-field-struct-return finding),
+  // has no such COPY - and unconditionally marking GP0 live-in regardless
+  // (this function's original Milestone 4 behavior) collides with
   // RegAllocFast::reloadAtBegin: it treats *any* physical register a block
   // declares live-in as already holding a valid value, silently skipping
   // the reload of any OTHER virtual register that also happens to have
@@ -930,8 +930,26 @@ MachineBasicBlock *MoeTargetLowering::emitCall(MachineInstr &MI,
   // discovered via a real, reproducible wrong-answer bug (not a crash),
   // not a hypothetical - see struct_abi_test.ll's excluded multi-field-
   // struct-return case before this fix.
+  //
+  // Milestone 18 found this scan needs to STOP at the next CALL pseudo, not
+  // scan the whole rest of ContinueBB: at the point any one CALL gets
+  // expanded, ContinueBB (freshly spliced from the single original block)
+  // still contains every LATER statement's code too, including any FURTHER,
+  // unrelated call's own `COPY $gp0` reading *its* return value - the
+  // original unscoped scan found that later COPY and wrongly concluded
+  // *this* call's result was consumed, marking GP0 live-in and making
+  // RegAllocFast skip reloading a same-named-register value (like an
+  // sret pointer) that's actually still needed after THIS call returns.
+  // Reproduced by a real wrong-answer bug (not a crash) once a
+  // sret-demoted call (any function returning a type wider than one
+  // register, e.g. `double`) was immediately followed, in the same
+  // originating block, by a further call whose own result IS a plain
+  // register return - see f64_test.c's chained-double-then-int-cast shape
+  // and run-f64-test.sh.
   bool ReturnValueConsumed = false;
   for (MachineInstr &Later : *ContinueBB) {
+    if (Later.getOpcode() == Moe::CALL)
+      break;
     if (Later.isCopy() && Later.getOperand(1).isReg() &&
         Later.getOperand(1).getReg() == Moe::GP0) {
       ReturnValueConsumed = true;
