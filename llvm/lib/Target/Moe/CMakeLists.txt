@@ -2,6 +2,7 @@ add_llvm_component_group(Moe)
 
 set(LLVM_TARGET_DEFINITIONS Moe.td)
 
+tablegen(LLVM MoeGenAsmMatcher.inc -gen-asm-matcher)
 tablegen(LLVM MoeGenAsmWriter.inc -gen-asm-writer)
 tablegen(LLVM MoeGenCallingConv.inc -gen-callingconv)
 tablegen(LLVM MoeGenDAGISel.inc -gen-dag-isel)
@@ -44,3 +45,4 @@ add_llvm_target(MoeCodeGen
 
 add_subdirectory(MCTargetDesc)
 add_subdirectory(TargetInfo)
+add_subdirectory(AsmParser)
