@@ -156,7 +156,11 @@ void MoeAsmPrinter::emitInstruction(const MachineInstr *MI) {
 void MoeAsmPrinter::emitMachineConstantPoolValue(
     MachineConstantPoolValue *MCPV) {
   auto *CPV = static_cast<MoeConstantPoolValue *>(MCPV);
-  const MCExpr *Expr = MCSymbolRefExpr::create(CPV->getSymbol(), OutContext);
+  // Either a symbol, or the label of another pool entry - which only exists
+  // here, at the point the AsmPrinter names it.
+  const MCExpr *Expr = MCSymbolRefExpr::create(
+      CPV->isCPIRef() ? GetCPISymbol(CPV->getCPIRef()) : CPV->getSymbol(),
+      OutContext);
   OutStreamer->emitValue(Expr, getDataLayout().getTypeAllocSize(CPV->getType()));
 }
 

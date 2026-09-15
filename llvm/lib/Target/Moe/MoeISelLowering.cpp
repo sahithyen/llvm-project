@@ -16,6 +16,7 @@
 #include "MoeSubtarget.h"
 #include "MoeTargetMachine.h"
 #include "llvm/CodeGen/CallingConvLower.h"
+#include "llvm/CodeGen/MachineConstantPool.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
@@ -390,14 +391,40 @@ SDValue MoeTargetLowering::LowerConstantPool(SDValue Op,
     Alignment = CP->getAlign();
   }
 
-  SDValue CPIdx = DAG.getTargetConstantPool(C, PtrVT, Alignment);
-  SDValue Wrapper = DAG.getNode(MoeISD::Wrapper, dl, PtrVT, CPIdx);
-  // The constant's VALUE, not its address, is what the caller wants (e.g.
-  // `add i32 %x, 5` needs the number 5, not where it's stored) - LOADabs
-  // reads through the pool entry to get it. The load is invariant/read-only
-  // constant-pool data, so DAG.getEntryNode() is a safe chain.
-  return DAG.getLoad(PtrVT, dl, DAG.getEntryNode(), Wrapper,
-                      MachinePointerInfo::getConstantPool(DAG.getMachineFunction()));
+  if (isa<ConstantSDNode>(Op)) {
+    // A constant VALUE, which this target has to keep in memory because there
+    // is no load-immediate: `add i32 %x, 5` needs the number 5, and LOADabs
+    // reads it out of the pool entry. The load is invariant constant-pool
+    // data, so DAG.getEntryNode() is a safe chain.
+    SDValue CPIdx = DAG.getTargetConstantPool(C, PtrVT, Alignment);
+    SDValue Wrapper = DAG.getNode(MoeISD::Wrapper, dl, PtrVT, CPIdx);
+    return DAG.getLoad(
+        PtrVT, dl, DAG.getEntryNode(), Wrapper,
+        MachinePointerInfo::getConstantPool(DAG.getMachineFunction()));
+  }
+
+  // An ISD::ConstantPool node, on the other hand, IS an address: the thing in
+  // the pool is an aggregate - a jump table of bytes, a lookup table, a
+  // spilled vector constant - and what the code wants is where it lives, to
+  // index into it. Returning its first word instead, which is what this used
+  // to do for every case alike, is a silent wrong answer: musl's malloc
+  // indexes a 32-byte de Bruijn table this way and dereferenced its contents
+  // as a pointer.
+  //
+  // Materializing that address needs a second pool entry holding it, because
+  // LOADabs always dereferences. Nothing in LLVM's Constant hierarchy can say
+  // "the address of pool entry 3", so the entry is a MoeConstantPoolValue
+  // naming that index, and the AsmPrinter resolves it to the label it gives
+  // that entry.
+  MachineFunction &MF = DAG.getMachineFunction();
+  unsigned CPI = MF.getConstantPool()->getConstantPoolIndex(C, Alignment);
+  MoeConstantPoolValue *CPV = MoeConstantPoolValue::CreateCPIRef(
+      PointerType::getUnqual(*DAG.getContext()), CPI);
+  SDValue AddrIdx = DAG.getTargetConstantPool(CPV, PtrVT, Align(4));
+  SDValue Wrapper = DAG.getNode(MoeISD::Wrapper, dl, PtrVT, AddrIdx);
+  return DAG.getLoad(
+      PtrVT, dl, DAG.getEntryNode(), Wrapper,
+      MachinePointerInfo::getConstantPool(DAG.getMachineFunction()));
 }
 
 SDValue MoeTargetLowering::LowerGlobalAddress(SDValue Op,

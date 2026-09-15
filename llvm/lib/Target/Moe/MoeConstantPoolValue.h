@@ -6,14 +6,20 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Wraps a raw MCSymbol (not an LLVM Constant/GlobalValue) so it can sit in a
-// MachineConstantPool entry. Used for the CALL sequence's return-address
-// label: LOADabs always dereferences its trailing address operand (see the
-// spec's LOAD section), so getting a label's address as a *value* into a
-// register requires the same pool-indirection LowerGlobalAddress/
-// LowerConstantPool use for every other constant - a plain .addSym(RetSym)
-// on LOADabs is wrong, since that treats RetSym's address as something to
-// read *from* rather than the value to load.
+// A constant-pool entry whose CONTENTS are an address that no LLVM Constant
+// can express: either a raw MCSymbol, or another constant-pool entry.
+//
+// Both exist for the same reason. LOADabs always dereferences its trailing
+// address operand (see the spec's LOAD section), so getting any address into a
+// register means reading it from somewhere that already holds it as data.
+//
+//  - A symbol: the CALL sequence's return-address label. A plain .addSym on
+//    LOADabs would treat the label's address as something to read *from*
+//    rather than as the value to load.
+//  - Another pool entry: the address of a pooled aggregate, which is what
+//    every reference to a table hoisted into the constant pool needs. There
+//    is no Constant for "the address of constant-pool entry 3", and the label
+//    it will be given does not exist until the AsmPrinter invents it.
 //
 //===----------------------------------------------------------------------===//
 
@@ -28,13 +34,19 @@ class MCSymbol;
 
 class MoeConstantPoolValue : public MachineConstantPoolValue {
   MCSymbol *Sym;
+  /// The index of the constant-pool entry whose address this entry holds, or
+  /// -1 when this entry holds `Sym` instead.
+  int CPIRef;
 
-  MoeConstantPoolValue(Type *Ty, MCSymbol *Sym);
+  MoeConstantPoolValue(Type *Ty, MCSymbol *Sym, int CPIRef);
 
 public:
   static MoeConstantPoolValue *Create(Type *Ty, MCSymbol *Sym);
+  static MoeConstantPoolValue *CreateCPIRef(Type *Ty, unsigned CPI);
 
   MCSymbol *getSymbol() const { return Sym; }
+  bool isCPIRef() const { return CPIRef >= 0; }
+  unsigned getCPIRef() const { return (unsigned)CPIRef; }
 
   int getExistingMachineCPValue(MachineConstantPool *CP,
                                 Align Alignment) override;

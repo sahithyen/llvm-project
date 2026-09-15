@@ -13,11 +13,16 @@
 
 using namespace llvm;
 
-MoeConstantPoolValue::MoeConstantPoolValue(Type *Ty, MCSymbol *Sym)
-    : MachineConstantPoolValue(Ty), Sym(Sym) {}
+MoeConstantPoolValue::MoeConstantPoolValue(Type *Ty, MCSymbol *Sym, int CPIRef)
+    : MachineConstantPoolValue(Ty), Sym(Sym), CPIRef(CPIRef) {}
 
 MoeConstantPoolValue *MoeConstantPoolValue::Create(Type *Ty, MCSymbol *Sym) {
-  return new MoeConstantPoolValue(Ty, Sym);
+  return new MoeConstantPoolValue(Ty, Sym, -1);
+}
+
+MoeConstantPoolValue *MoeConstantPoolValue::CreateCPIRef(Type *Ty,
+                                                          unsigned CPI) {
+  return new MoeConstantPoolValue(Ty, nullptr, (int)CPI);
 }
 
 int MoeConstantPoolValue::getExistingMachineCPValue(MachineConstantPool *CP,
@@ -28,7 +33,7 @@ int MoeConstantPoolValue::getExistingMachineCPValue(MachineConstantPool *CP,
         Constants[i].getAlign() >= Alignment) {
       auto *CPV =
           static_cast<MoeConstantPoolValue *>(Constants[i].Val.MachineCPVal);
-      if (CPV->Sym == Sym)
+      if (CPV->Sym == Sym && CPV->CPIRef == CPIRef)
         return i;
     }
   }
@@ -37,6 +42,12 @@ int MoeConstantPoolValue::getExistingMachineCPValue(MachineConstantPool *CP,
 
 void MoeConstantPoolValue::addSelectionDAGCSEId(FoldingSetNodeID &ID) {
   ID.AddPointer(Sym);
+  ID.AddInteger(CPIRef);
 }
 
-void MoeConstantPoolValue::print(raw_ostream &O) const { O << Sym->getName(); }
+void MoeConstantPoolValue::print(raw_ostream &O) const {
+  if (isCPIRef())
+    O << "&constantpool[" << CPIRef << "]";
+  else
+    O << Sym->getName();
+}
