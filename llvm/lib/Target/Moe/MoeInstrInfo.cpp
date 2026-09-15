@@ -11,6 +11,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "MoeInstrInfo.h"
+#include "MoeConstantPoolValue.h"
+#include "llvm/CodeGen/MachineConstantPool.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/MC/MCSymbol.h"
 #include "Moe.h"
 #include "MoeSubtarget.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
@@ -28,7 +32,70 @@ MoeInstrInfo::MoeInstrInfo(const MoeSubtarget &STI)
     : MoeGenInstrInfo(STI, RI, Moe::ADJCALLSTACKDOWN, Moe::ADJCALLSTACKUP),
       RI() {}
 
+// Expands the CALL/CALLreg pseudo into the real call sequence:
+//
+//   LOAD.W  [pool entry holding the continuation's label] -> GP4
+//   PUSH.W  GP4
+//   JUMP.AL <callee>            (or MOVE <callee> -> IA, indirect)
+//
+// This happens HERE, after register allocation, and that timing is the whole
+// point rather than an implementation detail.
+//
+// Moe has no call instruction, so a call is three instructions with a
+// mid-sequence PUSH - and everything between that PUSH and the jump sees a
+// stack pointer four bytes lower than the frame offsets were computed against.
+// While the sequence existed as three separate instructions during register
+// allocation, the allocator was free to insert spill and reload code into the
+// middle of it, and it did: at -O2 it placed a reload of a callee-saved
+// register AFTER the jump, in the gap between the jump and the continuation
+// block's label, where nothing ever executes.
+//
+// That is the same failure the mid-block EH_LABEL design produced at -O0 years
+// earlier (see MoeISelLowering::emitCall), and making the continuation a real
+// MachineBasicBlock fixed it only for RegAllocFast, whose reloadAtBegin puts
+// reloads at the start of the successor. Greedy places them at the end of the
+// predecessor, which for a block ending in a jump-that-is-not-a-terminator is
+// dead code.
+//
+// Found booting Linux: parse_args' `args` pointer came back holding the
+// callback's own address, because the reload restoring it sat after the jump.
+// The fix is to stop offering the middle of a call as a place to put anything:
+// as one MachineInstr, the allocator can only put code before the whole
+// sequence (where SP is still where the frame offsets expect it) or at the
+// start of the continuation block.
+bool MoeInstrInfo::expandCall(MachineInstr &MI) const {
+  MachineBasicBlock &MBB = *MI.getParent();
+  MachineFunction &MF = *MBB.getParent();
+  DebugLoc DL = MI.getDebugLoc();
+  bool IsIndirect = MI.getOpcode() == Moe::CALLSEQreg;
+  (void)MF;
+
+  // Operand 1 is the constant-pool slot holding the continuation label's
+  // address, put there by emitCall. LOADabs dereferences its trailing address
+  // operand, so reading the label's address as a VALUE needs exactly this
+  // indirection - the same one every other constant goes through.
+  BuildMI(MBB, MI, DL, get(Moe::LOADabs), Moe::GP4).add(MI.getOperand(1));
+  BuildMI(MBB, MI, DL, get(Moe::PUSH)).addReg(Moe::GP4, RegState::Kill);
+
+  MachineInstrBuilder MIB =
+      IsIndirect ? BuildMI(MBB, MI, DL, get(Moe::MOVE), Moe::IA)
+                       .addReg(MI.getOperand(0).getReg())
+                 : BuildMI(MBB, MI, DL, get(Moe::JMPabs)).add(MI.getOperand(0));
+
+  // Carry over the implicit argument-register uses and clobbers so they stay
+  // live to the jump rather than looking dead from here on.
+  for (unsigned i = 2, e = MI.getNumOperands(); i != e; ++i)
+    if (MI.getOperand(i).isReg() && MI.getOperand(i).isImplicit())
+      MIB.add(MI.getOperand(i));
+
+  MI.eraseFromParent();
+  return true;
+}
+
 bool MoeInstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
+  if (MI.getOpcode() == Moe::CALLSEQ || MI.getOpcode() == Moe::CALLSEQreg)
+    return expandCall(MI);
+
   // RET must still look like a real `isReturn` terminator when
   // PrologEpilogInserter runs (it's what tells PEI this block needs an
   // epilogue) - so its POP/MOVE-to-IA expansion happens here, in the

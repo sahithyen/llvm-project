@@ -103,7 +103,17 @@ def ADJCALLSTACKUP   : MoePseudo<(outs), (ins i32imm:$amt1, i32imm:$amt2),
 // GP4/GP5 are caller-saved scratch (see the ABI), so no explicit Defs list
 // is needed for them; the argument/return registers are marked used/defined
 // by MoeISelLowering::LowerCall via implicit operands on this pseudo.
-let isCall = 1, usesCustomInserter = 1, Uses = [SP], Defs = [SP] in
+// Defs lists what the sequence and the callee between them destroy, declared
+// here rather than attached to the expansion afterwards - because the pseudo
+// survives register allocation now, and this is what the allocator reads.
+//   GP0-GP3: caller-saved per the ABI, so the callee may use them as scratch
+//            whether or not this call site passed arguments through them.
+//   GP4/GP5: the sequence's own scratch (return address, and the indirect
+//            callee). Both are reserved from allocation anyway, so this is
+//            documentation more than constraint.
+//   SP:      the return-address PUSH.
+let isCall = 1, usesCustomInserter = 1, Uses = [SP],
+    Defs = [SP, GP0, GP1, GP2, GP3, GP4, GP5] in
 def CALL : MoePseudo<(outs), (ins calltarget:$callee), "#CALL $callee",
                       [(Moecall tglobaladdr:$callee)]>;
 
@@ -113,6 +123,52 @@ def CALL : MoePseudo<(outs), (ins calltarget:$callee), "#CALL $callee",
 // callee is a TargetExternalSymbol node instead of TargetGlobalAddress -
 // same CALL pseudo, alternate callee-matching pattern.
 def : Pat<(Moecall texternalsym:$callee), (CALL texternalsym:$callee)>;
+
+// An indirect call - through a function pointer, a vtable-like dispatch table,
+// or any of the hundreds of ops structures the Linux kernel is built out of.
+// Same custom inserter, same return-address-on-the-stack sequence; only the
+// last instruction differs, because the target is in a register rather than a
+// symbol. MOVE is what redirects control to a computed address (it is how RET
+// returns), so the jump is `MOVE $callee -> IA`, which is also one instruction
+// shorter than JUMP's register-indirect form would be - that would need a
+// trailing operand word to name the base register.
+let isCall = 1, usesCustomInserter = 1, Uses = [SP],
+    Defs = [SP, GP0, GP1, GP2, GP3, GP4, GP5] in
+def CALLreg : MoePseudo<(outs), (ins GPR:$callee), "#CALLreg $callee",
+                         [(Moecall GPR:$callee)]>;
+
+// What CALL/CALLreg become once emitCall has split the block: the same call,
+// plus the constant-pool slot holding the continuation label's address.
+//
+// The second operand is the reason these exist as separate defs rather than
+// the originals carrying it. The pool entry cannot be created during
+// instruction selection's pattern matching - there is no continuation block
+// yet - and it cannot be added to the original pseudo afterwards either, since
+// LowerCall has already attached implicit operands and an explicit one may not
+// follow those. So emitCall builds one of these and erases the original.
+//
+// Still a single instruction all the way through register allocation, and that
+// is the point - see MoeInstrInfo::expandCall.
+//
+// isTerminator is the other half of that point, and it is not cosmetic. A
+// terminator must be the last instruction in its block, which is the only
+// thing in LLVM that actually stops the register allocator appending spill
+// code after the call - and code after the call is dead, because the callee
+// returns to the continuation block's LABEL, not to the instruction following
+// the jump. Without it the allocator put a reload of a callee-saved register
+// there and the value it was restoring came back as the callee's own address.
+//
+// These are deliberately NOT isBranch: their target is a symbol or a register
+// rather than one of this function's MachineBasicBlocks, so
+// MoeInstrInfo::analyzeBranch sees a terminator it cannot analyse and says so,
+// which is exactly right - nothing should be rewriting this block's exit.
+let isCall = 1, isTerminator = 1, Uses = [SP],
+    Defs = [SP, GP0, GP1, GP2, GP3, GP4, GP5] in {
+def CALLSEQ : MoePseudo<(outs), (ins calltarget:$callee, moeaddr:$ret),
+                         "#CALLSEQ $callee, $ret", []>;
+def CALLSEQreg : MoePseudo<(outs), (ins GPR:$callee, moeaddr:$ret),
+                            "#CALLSEQreg $callee, $ret", []>;
+}
 
 // Expanded by MoeInstrInfo::expandPostRAPseudo (NOT a custom inserter -
 // this pseudo must still look like a real `isReturn` terminator when

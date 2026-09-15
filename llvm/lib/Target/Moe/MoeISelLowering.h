@@ -53,6 +53,8 @@ public:
 
   SDValue LowerShifts(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerGlobalAddress(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerBlockAddress(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerRETURNADDR(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerConstantPool(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerBR_CC(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerSETCC(SDValue Op, SelectionDAG &DAG) const;
@@ -68,6 +70,18 @@ public:
   MachineBasicBlock *
   EmitInstrWithCustomInserter(MachineInstr &MI,
                               MachineBasicBlock *BB) const override;
+
+  /// Switch statements become a chain of compares rather than a jump table.
+  ///
+  /// A table is perfectly implementable here - the entries would be absolute
+  /// addresses (there is no PC-relative form to choose between) and the
+  /// dispatch would be a load followed by MOVE -> IA. What it needs is BR_JT
+  /// expanded into BRIND, a BRIND instruction, and ISD::JumpTable lowered
+  /// through the same constant-pool indirection every other address goes
+  /// through. Left undone deliberately: it is a code-density optimisation on a
+  /// machine that will want one, not something a kernel needs to boot, and
+  /// turning it off is one line that cannot be subtly wrong.
+  bool areJTsAllowed(const Function *Fn) const override { return false; }
 
 private:
   SDValue LowerFormalArguments(SDValue Chain, CallingConv::ID CallConv,

@@ -59,6 +59,11 @@ public:
 
   bool expandPostRAPseudo(MachineInstr &MI) const override;
 
+private:
+  bool expandCall(MachineInstr &MI) const;
+
+public:
+
   void copyPhysReg(MachineBasicBlock &MBB, MachineBasicBlock::iterator I,
                     const DebugLoc &DL, Register DestReg, Register SrcReg,
                     bool KillSrc, bool RenamableDest = false,

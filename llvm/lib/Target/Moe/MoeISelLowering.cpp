@@ -50,6 +50,12 @@ MoeTargetLowering::MoeTargetLowering(const TargetMachine &TM,
   // literal pool (see the Milestone 1 plan's "Constant materialization").
   setOperationAction(ISD::Constant, MVT::i32, Custom);
   setOperationAction(ISD::GlobalAddress, MVT::i32, Custom);
+  // The address of a label, from GCC's `&&label` extension - which the kernel
+  // uses in _THIS_IP_, and therefore in every lockdep and tracing macro.
+  setOperationAction(ISD::BlockAddress, MVT::i32, Custom);
+  // __builtin_return_address, which the kernel reaches through _RET_IP_ in
+  // every lock, allocator and tracing path.
+  setOperationAction(ISD::RETURNADDR, MVT::i32, Custom);
   setOperationAction(ISD::ConstantPool, MVT::i32, Custom);
 
   // No CMP instruction (a compare is a SUB whose result is discarded - see
@@ -75,6 +81,21 @@ MoeTargetLowering::MoeTargetLowering(const TargetMachine &TM,
   // SELECT as an intermediate step), and Moe has no SELECT lowering of its
   // own to fall back to either.
   setOperationAction(ISD::SELECT_CC, MVT::i32, Custom);
+
+  // A bare SELECT (a condition already materialised as a 0/1 value, rather
+  // than a comparison the branch can read flags from) was left Legal, which
+  // means "the target handles this" - and nothing did, so it reached
+  // instruction selection and crashed with "Cannot select: ... = select".
+  // Nothing in llvm-tests/ produced one; the shape that does is ordinary
+  // kernel C where a condition is computed once and used to pick between two
+  // values, which is how the Linux build found it.
+  //
+  // Expand is exactly right here and does not contradict the note above:
+  // LegalizeDAG's expansion of SELECT rewrites it as SELECT_CC comparing the
+  // condition against zero, and SELECT_CC is Custom. The constraint that
+  // paragraph describes runs the other way - it is expanding SELECT_CC that
+  // would need a SELECT to lower through.
+  setOperationAction(ISD::SELECT, MVT::i32, Expand);
 
   // SHIFT moves exactly one bit per instruction - see MoeISelLowering::
   // LowerShifts and the Milestone 1 plan's SHIFT notes. Variable-amount
@@ -118,7 +139,6 @@ MoeTargetLowering::MoeTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::SRL_PARTS, MVT::i32, Expand);
   setOperationAction(ISD::SRA_PARTS, MVT::i32, Expand);
 
-  setOperationAction(ISD::DYNAMIC_STACKALLOC, MVT::i32, Expand);
   setOperationAction(ISD::STACKSAVE, MVT::Other, Expand);
   setOperationAction(ISD::STACKRESTORE, MVT::Other, Expand);
 
@@ -150,8 +170,52 @@ MoeTargetLowering::MoeTargetLowering(const TargetMachine &TM,
   // diagnostic is strictly better than a wrong answer.
   setOperationAction(ISD::DYNAMIC_STACKALLOC, MVT::i32, Custom);
 
+  //===--------------------------------------------------------------------===//
+  // Operations Moe has no instruction for, and no intention of growing one.
+  //
+  // Every one of these was left at its default of Legal, which claims the
+  // target handles it - so each reached instruction selection and crashed with
+  // "Cannot select". None of them was reachable from anything in llvm-tests/;
+  // they turned up building the Linux kernel, which is simply a far larger
+  // body of ordinary C than this backend had ever been pointed at.
+  //
+  // Expand is right for all of them rather than a libcall: the generic
+  // expansions are built from shifts, masks and adds, which is what this
+  // machine has, and a libcall would mean a runtime this kernel does not link
+  // against.
+  //===--------------------------------------------------------------------===//
+
+  // Bit counting. There is no instruction for any of these - which is also why
+  // Kconfig selects CPU_NO_EFFICIENT_FFS, so generic code prefers algorithms
+  // that do not lean on them.
+  for (auto Op : {ISD::CTTZ, ISD::CTTZ_ZERO_UNDEF, ISD::CTLZ,
+                  ISD::CTLZ_ZERO_UNDEF, ISD::CTPOP, ISD::BITREVERSE})
+    setOperationAction(Op, MVT::i32, Expand);
+
+  // Byte swapping: memory is little-endian and stays that way ('Endianness' in
+  // the Encoding chapter), so a swap is only ever an explicit one.
+  setOperationAction(ISD::BSWAP, MVT::i32, Expand);
+
+  // Rotates. SHIFT moves exactly one bit and has no rotate mode; the carry-in
+  // form chains a shift across words rather than around one.
+  setOperationAction(ISD::ROTL, MVT::i32, Expand);
+  setOperationAction(ISD::ROTR, MVT::i32, Expand);
+
+  // Min/max/abs are comparisons plus a select, which is what Expand produces.
+  for (auto Op : {ISD::SMIN, ISD::SMAX, ISD::UMIN, ISD::UMAX, ISD::ABS})
+    setOperationAction(Op, MVT::i32, Expand);
+
+  // Combined divide-and-remainder: Moe computes both in one loop already (see
+  // DIVMODPSEUDO), but through the separate SDIV/UDIV/SREM/UREM nodes, so the
+  // combined form has to decompose into those.
+  for (auto Op : {ISD::SDIVREM, ISD::UDIVREM})
+    setOperationAction(Op, MVT::i32, Expand);
+
   setOperationAction(ISD::VASTART, MVT::Other, Custom);
   setOperationAction(ISD::VAARG, MVT::Other, Expand);
+  // va_copy. For a plain-pointer va_list there is nothing to it but copying
+  // the pointer, which is exactly what Expand produces.
+  setOperationAction(ISD::VACOPY, MVT::Other, Expand);
   // va_end is a no-op for a plain-pointer va_list (nothing to release).
   setOperationAction(ISD::VAEND, MVT::Other, Expand);
 
@@ -169,6 +233,15 @@ MoeTargetLowering::MoeTargetLowering(const TargetMachine &TM,
     setLoadExtAction(ISD::EXTLOAD, MVT::i32, MemVT, Custom);
   }
 
+  // An i1 in memory occupies a whole byte, so a load of one is a byte load
+  // that then cares about a single bit - which is what Promote does, turning
+  // it into the i8 case handled above. Left at its Legal default it reached
+  // instruction selection as a load of a type no instruction has, and crashed;
+  // C's _Bool is where it comes from, which is why nothing in llvm-tests/
+  // produced one and the kernel produces them constantly.
+  for (auto ExtType : {ISD::ZEXTLOAD, ISD::SEXTLOAD, ISD::EXTLOAD})
+    setLoadExtAction(ExtType, MVT::i32, MVT::i1, Promote);
+
   // DAGCombiner can reuse an existing zextload's value for a sextload of
   // the same address (rather than emitting a second load) by wrapping it in
   // a SIGN_EXTEND_INREG - a distinct ISD opcode from the LOAD node
@@ -177,6 +250,7 @@ MoeTargetLowering::MoeTargetLowering(const TargetMachine &TM,
   // arithmetic-shift-right by the same amount) and, since SHL/SRA are
   // already Custom-lowered via LowerShifts's constant-amount chain above,
   // this reuses that existing, already-working machinery for free.
+  setOperationAction(ISD::SIGN_EXTEND_INREG, MVT::i1, Expand);
   setOperationAction(ISD::SIGN_EXTEND_INREG, MVT::i8, Expand);
   setOperationAction(ISD::SIGN_EXTEND_INREG, MVT::i16, Expand);
 }
@@ -196,6 +270,10 @@ SDValue MoeTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
     return LowerConstantPool(Op, DAG);
   case ISD::GlobalAddress:
     return LowerGlobalAddress(Op, DAG);
+  case ISD::BlockAddress:
+    return LowerBlockAddress(Op, DAG);
+  case ISD::RETURNADDR:
+    return LowerRETURNADDR(Op, DAG);
   case ISD::BR_CC:
     return LowerBR_CC(Op, DAG);
   case ISD::SETCC:
@@ -222,7 +300,11 @@ SDValue MoeTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
   case ISD::LOAD:
     return LowerExtLoad(Op, DAG);
   default:
-    llvm_unreachable("unimplemented operand");
+    // Naming the node is the difference between a five-minute fix and an
+    // afternoon: "unimplemented operand" on its own says nothing about which
+    // one, and the shapes that reach here come from code far away.
+    report_fatal_error(Twine("Moe: no lowering for SelectionDAG node '") +
+                       Op->getOperationName(&DAG) + "'");
   }
 }
 
@@ -234,6 +316,64 @@ SDValue MoeTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
 // itself a Constant, so LowerGlobalAddress reuses the exact same
 // TargetConstantPool + Wrapper mechanism.
 //===----------------------------------------------------------------------===//
+
+// The address of a basic block, as a value. Same shape as LowerGlobalAddress
+// and for the same reason: Moe cannot materialise any address except by
+// reading it out of memory, so the block's address goes into a constant pool
+// entry and is loaded from there. A BlockAddress is itself an LLVM Constant,
+// so it drops straight into a pool entry, and the AsmPrinter emits it as a
+// reference to the block's label.
+SDValue MoeTargetLowering::LowerBlockAddress(SDValue Op,
+                                              SelectionDAG &DAG) const {
+  auto *BAN = cast<BlockAddressSDNode>(Op);
+  const BlockAddress *BA = BAN->getBlockAddress();
+  int64_t Offset = BAN->getOffset();
+  EVT PtrVT = Op.getValueType();
+  SDLoc dl(Op);
+
+  const Constant *C = BA;
+  if (Offset != 0)
+    C = ConstantExpr::getGetElementPtr(
+        Type::getInt8Ty(*DAG.getContext()), const_cast<BlockAddress *>(BA),
+        ConstantInt::get(Type::getInt32Ty(*DAG.getContext()), Offset));
+
+  SDValue CPIdx = DAG.getTargetConstantPool(C, PtrVT, Align(4));
+  SDValue Wrapper = DAG.getNode(MoeISD::Wrapper, dl, PtrVT, CPIdx);
+  return DAG.getLoad(
+      PtrVT, dl, DAG.getEntryNode(), Wrapper,
+      MachinePointerInfo::getConstantPool(DAG.getMachineFunction()));
+}
+
+// __builtin_return_address(depth).
+//
+// Depth 0 is easy and exact: Moe has no call instruction, so the caller pushes
+// the return address itself and the callee's entry SP points straight at it
+// (see psabi.md's call sequence). A fixed stack object at offset 0 from entry
+// SP names that word, and eliminateFrameIndex resolves it against the final
+// frame size the same way it resolves an incoming stack argument.
+//
+// Any greater depth returns zero. Walking further needs a frame pointer to
+// find the caller's frame, and there is none - one of only six allocatable
+// registers is too high a price for it (psabi.md's stack section). Zero is
+// what the generic code already treats as "no further frames", so callers
+// degrade to a shorter backtrace rather than a wrong one.
+SDValue MoeTargetLowering::LowerRETURNADDR(SDValue Op,
+                                            SelectionDAG &DAG) const {
+  MachineFunction &MF = DAG.getMachineFunction();
+  MachineFrameInfo &MFI = MF.getFrameInfo();
+  EVT VT = Op.getValueType();
+  SDLoc dl(Op);
+
+  MFI.setReturnAddressIsTaken(true);
+
+  if (Op.getConstantOperandVal(0) != 0)
+    return DAG.getConstant(0, dl, VT);
+
+  int FI = MFI.CreateFixedObject(4, 0, true);
+  SDValue FIN = DAG.getFrameIndex(FI, getFrameIndexTy(DAG.getDataLayout()));
+  return DAG.getLoad(VT, dl, DAG.getEntryNode(), FIN,
+                     MachinePointerInfo::getFixedStack(MF, FI));
+}
 
 SDValue MoeTargetLowering::LowerConstantPool(SDValue Op,
                                               SelectionDAG &DAG) const {
@@ -768,12 +908,19 @@ SDValue MoeTargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
   // ExternalSymbolSDNode callee instead, referenced by name rather than by
   // GlobalValue*, since the calling module never defines it - same
   // TargetExternalSymbol treatment.
+  // A direct callee becomes a Target* node so legalization leaves it alone. An
+  // indirect one is an ordinary i32 value in a register and is passed through
+  // untouched - the CALLreg pattern matches on that, and emitCall ends the
+  // sequence with MOVE -> IA instead of JUMP.
+  //
+  // Indirect calls used to be a hard error here. Nothing in llvm-tests/ made
+  // one; the Linux kernel makes almost nothing else, since every driver,
+  // filesystem and subsystem is reached through a struct full of function
+  // pointers.
   if (auto *G = dyn_cast<GlobalAddressSDNode>(Callee))
     Callee = DAG.getTargetGlobalAddress(G->getGlobal(), dl, MVT::i32);
   else if (auto *ES = dyn_cast<ExternalSymbolSDNode>(Callee))
     Callee = DAG.getTargetExternalSymbol(ES->getSymbol(), MVT::i32);
-  else
-    report_fatal_error("Moe: only direct calls are supported (Milestone 1)");
 
   SDVTList NodeTys = DAG.getVTList(MVT::Other, MVT::Glue);
   SmallVector<SDValue, 8> Ops;
@@ -825,6 +972,7 @@ MoeTargetLowering::EmitInstrWithCustomInserter(MachineInstr &MI,
                                                 MachineBasicBlock *BB) const {
   switch (MI.getOpcode()) {
   case Moe::CALL:
+  case Moe::CALLreg:
     return emitCall(MI, BB);
   case Moe::MULPSEUDO:
     return emitMul(MI, BB);
@@ -845,9 +993,8 @@ MoeTargetLowering::EmitInstrWithCustomInserter(MachineInstr &MI,
 
 MachineBasicBlock *MoeTargetLowering::emitCall(MachineInstr &MI,
                                                 MachineBasicBlock *BB) const {
-  const TargetInstrInfo *TII = BB->getParent()->getSubtarget().getInstrInfo();
-  DebugLoc DL = MI.getDebugLoc();
   MachineFunction *MF = BB->getParent();
+  DebugLoc DL = MI.getDebugLoc();
 
   // The call's continuation - everything that originally followed MI in BB -
   // becomes a real MachineBasicBlock, not a mid-block EH_LABEL (Milestone
@@ -930,7 +1077,7 @@ MachineBasicBlock *MoeTargetLowering::emitCall(MachineInstr &MI,
   // and run-f64-test.sh.
   bool ReturnValueConsumed = false;
   for (MachineInstr &Later : *ContinueBB) {
-    if (Later.getOpcode() == Moe::CALL)
+    if (Later.getOpcode() == Moe::CALL || Later.getOpcode() == Moe::CALLreg)
       break;
     if (Later.isCopy() && Later.getOperand(1).isReg() &&
         Later.getOperand(1).getReg() == Moe::GP0) {
@@ -964,51 +1111,33 @@ MachineBasicBlock *MoeTargetLowering::emitCall(MachineInstr &MI,
   ContinueBB->setMachineBlockAddressTaken();
   MCSymbol *RetSym = ContinueBB->getSymbol();
 
-  // LOADabs always dereferences its trailing address operand (loads
-  // memory[addr], not addr itself - see the spec's LOAD section), so getting
-  // RetSym's address as a *value* into GP4 needs the same pool indirection
-  // every other constant goes through (LowerConstantPool/LowerGlobalAddress):
-  // a pool slot holding RetSym's address, read through by LOADabs.
+  // The sequence itself - LOADabs, PUSH, jump - is NOT built here. It is built
+  // by MoeInstrInfo::expandCall, after register allocation, and that split is
+  // deliberate: see that function for the wrong-answer bug that came of
+  // leaving the middle of a call available for the allocator to put spill code
+  // into.
+  //
+  // What happens here is the block split, which has to happen during ISel so
+  // the continuation exists as a real MachineBasicBlock for the allocator to
+  // reason about, and swapping the pseudo for one that carries the pool slot
+  // holding the continuation's address.
   Type *PtrTy = Type::getInt32Ty(MF->getFunction().getContext());
   MoeConstantPoolValue *CPV = MoeConstantPoolValue::Create(PtrTy, RetSym);
   unsigned CPIdx = MF->getConstantPool()->getConstantPoolIndex(CPV, Align(4));
 
-  // LOAD.W [pool entry containing RetSym] -> GP4 ; PUSH.W GP4 ; JUMP.AL [callee]
-  // ; ContinueBB (RetSym):
-  BuildMI(*BB, MI, DL, TII->get(Moe::LOADabs), Moe::GP4)
-      .addConstantPoolIndex(CPIdx);
-  BuildMI(*BB, MI, DL, TII->get(Moe::PUSH)).addReg(Moe::GP4, RegState::Kill);
+  bool IsIndirect = MI.getOpcode() == Moe::CALLreg;
+  const TargetInstrInfo *TII = MF->getSubtarget().getInstrInfo();
   MachineInstrBuilder MIB =
-      BuildMI(*BB, MI, DL, TII->get(Moe::JMPabs)).add(MI.getOperand(0));
-  // Preserve the implicit arg-register uses the variadic Moecall pattern
-  // attached to the pseudo, so they stay live across the expansion.
+      BuildMI(*BB, MI, DL,
+              TII->get(IsIndirect ? Moe::CALLSEQreg : Moe::CALLSEQ));
+  if (IsIndirect)
+    MIB.addReg(MI.getOperand(0).getReg());
+  else
+    MIB.add(MI.getOperand(0));
+  MIB.addConstantPoolIndex(CPIdx);
+  // Everything LowerCall attached - the argument registers going in.
   for (unsigned i = 1, e = MI.getNumOperands(); i != e; ++i)
     MIB.add(MI.getOperand(i));
-  // Every call defines GP0 (RetCC_Moe assigns every i32 return there,
-  // unconditionally - even a void call's callee still executes a RET that
-  // restores GP0 to *some* value), but nothing on this pseudo said so before
-  // now: LowerCallResult's `COPY $gp0` right after the call relied on GP0
-  // merely *looking* defined from an earlier argument load (the verifier's
-  // linear scan doesn't know the call clobbers it in between) - which broke
-  // for a zero-argument call, where GP0 was never touched at all before the
-  // read. Declaring the real semantic fact directly fixes both cases.
-  //
-  // GP1-GP3 need the same treatment, for a related but distinct reason: they
-  // (like GP0) are caller-saved per the ABI (only GP6/GP7 are callee-saved -
-  // see MoeRegisterInfo::getCalleeSavedRegs), so the callee is free to use
-  // them as scratch regardless of whether THIS call site happened to pass an
-  // argument through them - LowerCall only ever attached them as implicit
-  // *uses* (the argument values going in), never as clobbers. RegAllocFast
-  // never noticed: it reloads every value from its spill slot before each
-  // use regardless of clobber info, so an incomplete clobber list was
-  // invisible at -O0. The Greedy allocator (-O1+) trusts clobber info to
-  // decide what's safe to keep live across a call in a register - without
-  // this, it could leave some other still-needed value sitting in GP1/GP2/
-  // GP3 across the call, for the callee to silently stomp on. Confirmed via
-  // a real, reproducible wrong-answer bug (not a crash) on cross_call_test.ll
-  // at -O1 - GP0 read back as 0 instead of the second call's real result.
-  for (unsigned Reg : {Moe::GP0, Moe::GP1, Moe::GP2, Moe::GP3})
-    MIB.addReg(Reg, RegState::ImplicitDefine);
 
   MI.eraseFromParent();
   return ContinueBB;
