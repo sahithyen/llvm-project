@@ -10,22 +10,24 @@
 ; correctness proof is llvm-tests/run-mul-test.sh, run-muldiv-test.sh and
 ; run-sdiv-test.sh, which actually execute the compiled output.
 
+; The multiply loop runs for the multiplier's bit length rather than a fixed 32
+; iterations: one SHIFT's C and Z feed three conditional jumps in a row.
 ; CHECK-LABEL: mulf:
-; CHECK: xor {{.*}} -> [[RESULT:gp[0-9]+]]
-; CHECK: increment {{.*}} += 32
+; CHECK: xor {{.*}} -> {{.*}}
 ; CHECK: shift.right {{.*}} -> {{.*}}
-; CHECK: jump.CC
+; CHECK: jump.HI
+; CHECK: jump.CS
+; CHECK: jump.EQ
+; CHECK: shift.left {{.*}} -> {{.*}}
 ; CHECK: add {{.*}} -> {{.*}}
 ; CHECK: shift.left {{.*}} -> {{.*}}
-; CHECK: increment {{.*}} += 1
-; CHECK: sub {{.*}} -> (dead)
-; CHECK: jump.NE
+; CHECK-NOT: increment {{.*}} += 32
+; CHECK-LABEL: udivremf:
 define i32 @mulf(i32 %a, i32 %b) {
   %r = mul i32 %a, %b
   ret i32 %r
 }
 
-; CHECK-LABEL: udivremf:
 ; CHECK: increment {{.*}} += 32
 ; CHECK: shift.left {{.*}} -> {{.*}}
 ; CHECK: shift.left.c {{.*}} -> {{.*}}

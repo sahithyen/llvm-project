@@ -83,10 +83,14 @@ TrailingOperand getTrailingOperand(const MCInst &MI) {
     break;
   case Moe::LOADabs:
   case Moe::STOREabs:
+  case Moe::LOADabs_A:
+  case Moe::STOREabs_A:
     T.SymOperand = 1;
     break;
   case Moe::LOADrr:
   case Moe::STORErr:
+  case Moe::LOADrr_A:
+  case Moe::STORErr_A:
   // STORErr_B/H have the same (ins GPR:$reg, moemem:$addr) shape as
   // STORErr - no tied operand - so the base register is still operand 1.
   case Moe::STORErr_B:

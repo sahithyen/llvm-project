@@ -22,6 +22,12 @@ MoeMCAsmInfo::MoeMCAsmInfo(const Triple &TT) {
   CalleeSaveStackSlotSize = 4;
 
   CommentString = ";";
+  // With ';' taken by comments, statements on one line are separated by a
+  // backtick instead - ARC's convention, for the same reason. The default
+  // separator is also ';', which silently made everything after the first
+  // statement a comment: Linux's ENTRY() macro joins `.globl name`, the
+  // alignment and `name:` with a separator, and got only the `.globl`.
+  SeparatorString = "`";
 
   AlignmentIsInBytes = false;
   UsesELFSectionDirectiveForBSS = true;

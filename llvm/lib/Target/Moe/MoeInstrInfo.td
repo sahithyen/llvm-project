@@ -305,6 +305,20 @@ def ADD : AddSubForm<0b1001, (outs GPR:$o), (ins GPR:$a, GPR:$b),
 def SUB : AddSubForm<0b1010, (outs GPR:$o), (ins GPR:$a, GPR:$b),
                       "sub $a, $b -> $o",
                       [(set GPR:$o, (sub GPR:$a, GPR:$b))]>;
+
+// ADD and SUB with Carry in enabled - see 'Flags' in the Encoding chapter,
+// which is how a multi-word addition or subtraction chains. Instruction
+// selection does not use them (64-bit arithmetic is lowered through
+// comparisons today), but hand-written multi-word arithmetic does: the
+// kernel's 64-bit multiply and divide helpers are two-instruction 64-bit adds
+// and subtracts with these, where C would otherwise need a compare and a
+// branch to propagate.
+let carryin = 1, Uses = [F] in {
+def ADDc : AddSubForm<0b1001, (outs GPR:$o), (ins GPR:$a, GPR:$b),
+                       "add.c $a, $b -> $o", []>;
+def SUBc : AddSubForm<0b1010, (outs GPR:$o), (ins GPR:$a, GPR:$b),
+                       "sub.c $a, $b -> $o", []>;
+}
 }
 
 // Comparison-only SUB (Test-mode-equivalent): Moe has no CMP opcode, so a
@@ -552,6 +566,32 @@ def LOADrr : LoadStoreForm<0b0101, 0b10, (outs GPR:$reg), (ins moemem:$addr),
 def STORErr : LoadStoreForm<0b0110, 0b10, (outs), (ins GPR:$reg, moemem:$addr),
                              "store.w $reg -> $addr",
                              [(store GPR:$reg, moeaddr_ri:$addr)]>;
+
+// The same four instructions with any of the sixteen registers as the loaded,
+// stored, pushed or popped register. The ISA's field is a full 'Register
+// selection' for all of them, and supervisor code needs the wide forms: trap
+// entry loads SP straight from a kernel variable, and the return path loads
+// RA, RF and IM from the saved frame - see 'Privileged registers' in the Traps
+// chapter for the privilege rule those follow. Compiled code never names
+// anything but GP0-GP7 here, so these carry no patterns and exist only for
+// the assembler; the GPR-only defs above stay what instruction selection and
+// the MC layer's register classes see. The matcher prefers the GPR form for a
+// general register (GPR is a subclass of AllReg), and the encodings agree
+// either way.
+let isAsmParserOnly = 1 in {
+def LOADabs_A : LoadStoreForm<0b0101, 0b00, (outs AllReg:$reg),
+                               (ins moeaddr:$addr), "load.w $addr -> $reg", []>;
+def STOREabs_A : LoadStoreForm<0b0110, 0b00, (outs),
+                                (ins AllReg:$reg, moeaddr:$addr),
+                                "store.w $reg -> $addr", []>;
+def LOADrr_A : LoadStoreForm<0b0101, 0b10, (outs AllReg:$reg),
+                              (ins moemem:$addr), "load.w $addr -> $reg", []>;
+def STORErr_A : LoadStoreForm<0b0110, 0b10, (outs),
+                               (ins AllReg:$reg, moemem:$addr),
+                               "store.w $reg -> $addr", []>;
+def PUSH_A : PushPopForm<0b0111, (outs), (ins AllReg:$reg), "push $reg", []>;
+def POP_A  : PushPopForm<0b1000, (outs AllReg:$reg), (ins), "pop $reg", []>;
+}
 
 // A bare stack-object address used as an ordinary i32 VALUE (as opposed to a
 // LOAD/STORE address operand, which already works via moeaddr_ri/SelectAddr

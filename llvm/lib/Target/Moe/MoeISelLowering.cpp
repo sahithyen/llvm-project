@@ -464,20 +464,9 @@ SDValue MoeTargetLowering::LowerShifts(SDValue Op, SelectionDAG &DAG) const {
     // node (bypassing SelectionDAG pattern matching, same as LowerMUL),
     // expanded into a real runtime loop by emitVarShift after instruction
     // selection.
-    //
-    // The amount is masked to 0-31 first. An out-of-range amount is poison
-    // in IR, so any result is correct - but a loop that counts up to the raw
-    // amount spins about four billion times for an amount of -1, and that is
-    // not a wrong answer, it is a hang. It is also not hypothetical: clang
-    // turns `c ? x >> (s - 12) : x << (12 - s)` into a select over both
-    // shifts, so the unselected one runs with a negative amount on every
-    // call. Linux's alloc_large_system_hash does exactly that.
     SDValue OpcConst = DAG.getTargetConstant(RealOpc, dl, MVT::i32);
-    SDValue Mask = DAG.getConstant(VT.getSizeInBits() - 1, dl, MVT::i32);
-    SDValue MaskedAmt = DAG.getNode(ISD::AND, dl, MVT::i32, N->getOperand(1),
-                                    Mask);
     return SDValue(DAG.getMachineNode(Moe::VARSHIFTPSEUDO, dl, VT,
-                                       N->getOperand(0), MaskedAmt,
+                                       N->getOperand(0), N->getOperand(1),
                                        OpcConst),
                    0);
   }
@@ -1156,34 +1145,39 @@ MachineBasicBlock *MoeTargetLowering::emitCall(MachineInstr &MI,
 
 //===----------------------------------------------------------------------===//
 // Software multiply - SHIFT moves exactly one bit per instruction (see the
-// spec's SHIFT section) and its carry-out is the bit shifted out, so this
-// loop tests each multiplier bit directly off SHIFT's C flag: no separate
-// AND-with-1 masking instruction needed (and AND has no immediate-mask form
-// anyway) - see the Milestone 3 plan's "Software multiply" section.
+// spec's SHIFT section) and its carry-out is the bit shifted out, so each
+// multiplier bit is tested directly off SHIFT's C flag, with no AND and no
+// mask constant.
+//
+// The loop runs once per bit of the multiplier's *length*, not 32 times: the
+// same SHIFT that puts the low bit in C also sets Z when what is left of the
+// multiplier is zero, and a JUMP reads flags without changing them, so a
+// chain of conditional jumps can act on both. That matters more than it
+// looks. The kernel multiplies by small constants and by 16-bit halves all
+// the time (every 64-bit multiply is built from four 16x16 ones), and a
+// fixed 32-iteration loop spent over a thousand instructions on each 64-bit
+// multiply - enough, with the other 64-bit helpers, for a single timer
+// interrupt to outlast the timer period.
 //
 // Blocks (BB is MULPSEUDO's parent block, split at the pseudo):
-//   BB:         multiplicand/multiplier copies, result/counter/bound seeded
-//               via self-XOR (always zero, regardless of the register's
-//               prior value - there's no load-immediate instruction) and
-//               INCREMENT's immediate field (bound = 32); falls through to
+//   BB:         multiplicand/multiplier copies, result seeded to zero via
+//               self-XOR (there is no load-immediate). Falls through to
 //               LoopBB.
-//   LoopBB:     shift multiplier right by 1 (C = old bit0); if C is clear,
-//               branch straight to ContinueBB (skip the add); otherwise
-//               fall through to AddBB.
-//   AddBB:      result += multiplicand; falls through to ContinueBB.
-//   ContinueBB: merges result (PHI: unchanged value from LoopBB's skip edge,
-//               or AddBB's updated value); shifts multiplicand left by 1;
-//               increments counter; compares counter against bound (32);
-//               loops back to LoopBB while not equal, else falls through to
-//               ExitBB.
-//   ExitBB:     receives MULPSEUDO's original successors; copies the final
-//               result into MULPSEUDO's original destination register.
+//   LoopBB:     shift multiplier right by 1: C = the bit shifted out, Z = the
+//               rest is zero. C=1 and Z=0 jumps to AddLoopBB.
+//   TestAddBB:  C=1 (so Z=1): jumps to AddExitBB.
+//   TestExitBB: C=0 and Z=1: jumps to ExitBB.
+//   SkipBB:     C=0 and Z=0: shift multiplicand left, back to LoopBB.
+//   AddLoopBB:  result += multiplicand, shift multiplicand left, back to
+//               LoopBB.
+//   AddExitBB:  result += multiplicand; falls through to ExitBB.
+//   ExitBB:     receives MULPSEUDO's original successors; the result is the
+//               PHI of TestExitBB's and AddExitBB's, copied into the pseudo's
+//               destination.
 //
-// Flags are always consumed by the very next instruction after whatever set
-// them (SHIFT's C by the immediately-following JCC.CC; the counter/bound
-// SUBcmp's Z by the immediately-following JCC.NE), with nothing else
-// touching F in between - so no flag-preservation trick is needed despite
-// ADD/SHIFT/INCREMENT all clobbering S/Z/C/O as a side effect.
+// Only JUMPs sit between the SHIFT and the flags it set being read, and a
+// spill or reload the register allocator puts there is a LOAD, STORE or
+// MOVE, none of which touch F.
 //===----------------------------------------------------------------------===//
 
 MachineBasicBlock *MoeTargetLowering::emitMul(MachineInstr &MI,
@@ -1201,153 +1195,131 @@ MachineBasicBlock *MoeTargetLowering::emitMul(MachineInstr &MI,
   const BasicBlock *LLVM_BB = BB->getBasicBlock();
   MachineFunction::iterator InsertPt = ++BB->getIterator();
   MachineBasicBlock *LoopBB = MF->CreateMachineBasicBlock(LLVM_BB);
-  MachineBasicBlock *AddBB = MF->CreateMachineBasicBlock(LLVM_BB);
-  MachineBasicBlock *ContinueBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *TestAddBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *TestExitBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *SkipBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *AddLoopBB = MF->CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *AddExitBB = MF->CreateMachineBasicBlock(LLVM_BB);
   MachineBasicBlock *ExitBB = MF->CreateMachineBasicBlock(LLVM_BB);
-  MF->insert(InsertPt, LoopBB);
-  MF->insert(InsertPt, AddBB);
-  MF->insert(InsertPt, ContinueBB);
-  MF->insert(InsertPt, ExitBB);
+  for (MachineBasicBlock *New : {LoopBB, TestAddBB, TestExitBB, SkipBB,
+                                 AddLoopBB, AddExitBB, ExitBB})
+    MF->insert(InsertPt, New);
 
   ExitBB->splice(ExitBB->begin(), BB,
                  std::next(MachineBasicBlock::iterator(MI)), BB->end());
   ExitBB->transferSuccessorsAndUpdatePHIs(BB);
 
   BB->addSuccessor(LoopBB);
-  LoopBB->addSuccessor(ContinueBB); // carry clear: skip the add
-  LoopBB->addSuccessor(AddBB);      // carry set: fall through to the add
-  AddBB->addSuccessor(ContinueBB);
-  ContinueBB->addSuccessor(LoopBB); // counter != bound: loop back
-  ContinueBB->addSuccessor(ExitBB); // counter == bound: done
+  LoopBB->addSuccessor(AddLoopBB);
+  LoopBB->addSuccessor(TestAddBB);
+  TestAddBB->addSuccessor(AddExitBB);
+  TestAddBB->addSuccessor(TestExitBB);
+  TestExitBB->addSuccessor(ExitBB);
+  TestExitBB->addSuccessor(SkipBB);
+  SkipBB->addSuccessor(LoopBB);
+  AddLoopBB->addSuccessor(LoopBB);
+  AddExitBB->addSuccessor(ExitBB);
 
-  // Every virtual register the loop touches is declared up front so PHIs
-  // can reference values defined later in program order (the back-edge
-  // inputs from ContinueBB), matching the same forward-declaration
-  // technique MSP430's EmitShiftInstr uses for its shift-amount/shift-value
-  // PHIs.
-  Register Multiplicand0 = MRI.createVirtualRegister(RC);
-  Register Multiplier0 = MRI.createVirtualRegister(RC);
-  Register Result0 = MRI.createVirtualRegister(RC);
-  Register Counter0 = MRI.createVirtualRegister(RC);
-  Register Bound = MRI.createVirtualRegister(RC);
-
-  Register MultiplicandPhi = MRI.createVirtualRegister(RC);
-  Register MultiplierPhi = MRI.createVirtualRegister(RC);
-  Register ResultPhi = MRI.createVirtualRegister(RC);
-  Register CounterPhi = MRI.createVirtualRegister(RC);
-  Register MultiplierNext = MRI.createVirtualRegister(RC);
-  Register ResultAdded = MRI.createVirtualRegister(RC);
-  Register ResultNext = MRI.createVirtualRegister(RC);
-  Register MultiplicandNext = MRI.createVirtualRegister(RC);
-  Register CounterNext = MRI.createVirtualRegister(RC);
-  Register BoundZero = MRI.createVirtualRegister(RC);
+  Register A0 = MRI.createVirtualRegister(RC);
+  Register B0 = MRI.createVirtualRegister(RC);
+  Register R0 = MRI.createVirtualRegister(RC);
+  Register APhi = MRI.createVirtualRegister(RC);
+  Register BPhi = MRI.createVirtualRegister(RC);
+  Register RPhi = MRI.createVirtualRegister(RC);
+  Register BNext = MRI.createVirtualRegister(RC);
+  Register ASkip = MRI.createVirtualRegister(RC);
+  Register RAddLoop = MRI.createVirtualRegister(RC);
+  Register AAddLoop = MRI.createVirtualRegister(RC);
+  Register RAddExit = MRI.createVirtualRegister(RC);
+  Register RExit = MRI.createVirtualRegister(RC);
 
   // BB
-  BuildMI(*BB, MI, DL, TII->get(TargetOpcode::COPY), Multiplicand0)
-      .addReg(AReg);
-  BuildMI(*BB, MI, DL, TII->get(TargetOpcode::COPY), Multiplier0)
-      .addReg(BReg);
-  BuildMI(*BB, MI, DL, TII->get(Moe::XOR), Result0)
-      .addReg(Multiplicand0)
-      .addReg(Multiplicand0);
-  BuildMI(*BB, MI, DL, TII->get(Moe::XOR), Counter0)
-      .addReg(Multiplicand0)
-      .addReg(Multiplicand0);
-  // Bound = 32: INCREMENT's tied "$o = $oin" constraint needs oin to be a
-  // *different* SSA value than the fresh result register it defines - see
-  // the Milestone 3 plan/emitSDivRem's verifier-caught bug note - so the
-  // zeroed seed (BoundZero) and the incremented result (Bound) must be
-  // distinct virtual registers, not the same one reused in place.
-  BuildMI(*BB, MI, DL, TII->get(Moe::XOR), BoundZero)
-      .addReg(Multiplicand0)
-      .addReg(Multiplicand0);
-  BuildMI(*BB, MI, DL, TII->get(Moe::INCREMENT), Bound)
-      .addReg(BoundZero)
-      .addImm(32);
+  BuildMI(*BB, MI, DL, TII->get(TargetOpcode::COPY), A0).addReg(AReg);
+  BuildMI(*BB, MI, DL, TII->get(TargetOpcode::COPY), B0).addReg(BReg);
+  BuildMI(*BB, MI, DL, TII->get(Moe::XOR), R0).addReg(A0).addReg(A0);
 
-  // LoopBB: MultiplicandPhi/CounterPhi/ResultPhi's back-edge values are
-  // defined in ContinueBB; MultiplierPhi's back-edge value (MultiplierNext)
-  // is defined right here in LoopBB and simply flows unchanged through
-  // AddBB/ContinueBB back to this PHI.
-  BuildMI(LoopBB, DL, TII->get(TargetOpcode::PHI), MultiplicandPhi)
-      .addReg(Multiplicand0).addMBB(BB)
-      .addReg(MultiplicandNext).addMBB(ContinueBB);
-  BuildMI(LoopBB, DL, TII->get(TargetOpcode::PHI), MultiplierPhi)
-      .addReg(Multiplier0).addMBB(BB)
-      .addReg(MultiplierNext).addMBB(ContinueBB);
-  BuildMI(LoopBB, DL, TII->get(TargetOpcode::PHI), ResultPhi)
-      .addReg(Result0).addMBB(BB)
-      .addReg(ResultNext).addMBB(ContinueBB);
-  BuildMI(LoopBB, DL, TII->get(TargetOpcode::PHI), CounterPhi)
-      .addReg(Counter0).addMBB(BB)
-      .addReg(CounterNext).addMBB(ContinueBB);
-  BuildMI(LoopBB, DL, TII->get(Moe::SRL), MultiplierNext).addReg(MultiplierPhi);
+  // LoopBB
+  BuildMI(LoopBB, DL, TII->get(TargetOpcode::PHI), APhi)
+      .addReg(A0).addMBB(BB)
+      .addReg(ASkip).addMBB(SkipBB)
+      .addReg(AAddLoop).addMBB(AddLoopBB);
+  BuildMI(LoopBB, DL, TII->get(TargetOpcode::PHI), BPhi)
+      .addReg(B0).addMBB(BB)
+      .addReg(BNext).addMBB(SkipBB)
+      .addReg(BNext).addMBB(AddLoopBB);
+  BuildMI(LoopBB, DL, TII->get(TargetOpcode::PHI), RPhi)
+      .addReg(R0).addMBB(BB)
+      .addReg(RPhi).addMBB(SkipBB)
+      .addReg(RAddLoop).addMBB(AddLoopBB);
+  BuildMI(LoopBB, DL, TII->get(Moe::SRL), BNext).addReg(BPhi);
   BuildMI(LoopBB, DL, TII->get(Moe::JCC))
-      .addMBB(ContinueBB)
-      .addImm(MoeCC::COND_CC);
+      .addMBB(AddLoopBB)
+      .addImm(MoeCC::COND_HI);
 
-  // AddBB
-  BuildMI(AddBB, DL, TII->get(Moe::ADD), ResultAdded)
-      .addReg(ResultPhi)
-      .addReg(MultiplicandPhi);
+  // TestAddBB, TestExitBB: still the flags LoopBB's SHIFT set.
+  BuildMI(TestAddBB, DL, TII->get(Moe::JCC))
+      .addMBB(AddExitBB)
+      .addImm(MoeCC::COND_CS);
+  BuildMI(TestExitBB, DL, TII->get(Moe::JCC))
+      .addMBB(ExitBB)
+      .addImm(MoeCC::COND_EQ);
 
-  // ContinueBB
-  BuildMI(*ContinueBB, ContinueBB->begin(), DL, TII->get(TargetOpcode::PHI),
-          ResultNext)
-      .addReg(ResultPhi).addMBB(LoopBB)
-      .addReg(ResultAdded).addMBB(AddBB);
-  BuildMI(ContinueBB, DL, TII->get(Moe::SHL), MultiplicandNext)
-      .addReg(MultiplicandPhi);
-  BuildMI(ContinueBB, DL, TII->get(Moe::INCREMENT), CounterNext)
-      .addReg(CounterPhi)
-      .addImm(1);
-  BuildMI(ContinueBB, DL, TII->get(Moe::SUBcmp))
-      .addReg(CounterNext)
-      .addReg(Bound);
-  BuildMI(ContinueBB, DL, TII->get(Moe::JCC))
-      .addMBB(LoopBB)
-      .addImm(MoeCC::COND_NE);
+  // SkipBB
+  BuildMI(SkipBB, DL, TII->get(Moe::SHL), ASkip).addReg(APhi);
+  BuildMI(SkipBB, DL, TII->get(Moe::JMP)).addMBB(LoopBB);
 
-  // ExitBB: ContinueBB is ExitBB's only predecessor, so a plain COPY
-  // suffices - no PHI needed for a single incoming value.
-  BuildMI(*ExitBB, ExitBB->begin(), DL, TII->get(TargetOpcode::COPY), DstReg)
-      .addReg(ResultNext);
+  // AddLoopBB
+  BuildMI(AddLoopBB, DL, TII->get(Moe::ADD), RAddLoop)
+      .addReg(RPhi)
+      .addReg(APhi);
+  BuildMI(AddLoopBB, DL, TII->get(Moe::SHL), AAddLoop).addReg(APhi);
+  BuildMI(AddLoopBB, DL, TII->get(Moe::JMP)).addMBB(LoopBB);
+
+  // AddExitBB
+  BuildMI(AddExitBB, DL, TII->get(Moe::ADD), RAddExit)
+      .addReg(RPhi)
+      .addReg(APhi);
+  BuildMI(AddExitBB, DL, TII->get(Moe::JMP)).addMBB(ExitBB);
+
+  // ExitBB
+  MachineBasicBlock::iterator ExitBegin = ExitBB->begin();
+  BuildMI(*ExitBB, ExitBegin, DL, TII->get(TargetOpcode::PHI), RExit)
+      .addReg(RPhi).addMBB(TestExitBB)
+      .addReg(RAddExit).addMBB(AddExitBB);
+  BuildMI(*ExitBB, ExitBegin, DL, TII->get(TargetOpcode::COPY), DstReg)
+      .addReg(RExit);
 
   MI.eraseFromParent();
   return ExitBB;
 }
 
 //===----------------------------------------------------------------------===//
-// Software variable-amount shift - same runtime-loop shape as emitMul, but
-// simpler (no conditional add step: every iteration does the same
-// unconditional single-bit shift) and, critically, WHILE-shaped rather than
-// emitMul/emitDivRem's do-while shape: a runtime shift amount of 0 is valid
-// and common and must produce the input unchanged, so the counter-vs-amount
-// check must happen before any shift executes, not after (emitMul's
-// do-while shape is only safe there because MUL/DIV always run exactly 32
-// iterations regardless of operand value).
+// Software variable-amount shift. SHIFT moves one bit per instruction, so a
+// shift by a runtime amount N has to execute N of them - but it does not have
+// to count to N. The amount's five low bits are shifted out one at a time,
+// each into C, and bit k set means "do 2^k single shifts now":
 //
-// Blocks (BB is VARSHIFTPSEUDO's parent block, split at the pseudo):
-//   BB:         value/amount copies (Value0, Amt0); counter seeded to 0 via
-//               self-XOR (same trick emitMul's BB uses); falls through to
-//               LoopBB. Amt0 is loop-invariant, so it's referenced directly
-//               by LoopBB rather than threaded through a PHI (the same way
-//               emitMul's Bound is referenced directly by ContinueBB).
-//   LoopBB:     PHI-merges ValuePhi/CounterPhi (back-edge values defined in
-//               ContinueBB); compares CounterPhi against Amt0 - if equal,
-//               the requested number of shifts has already happened, so
-//               branch to ExitBB (this is what makes amt=0 correct: on the
-//               very first pass through LoopBB, CounterPhi is still 0, so
-//               an amt of 0 branches straight to ExitBB without ever
-//               reaching ContinueBB); otherwise falls through to ContinueBB.
-//   ContinueBB: one unconditional single-bit shift (Moe::SHL/SRL/SRA,
-//               selected by the pseudo's $opc operand) on ValuePhi ->
-//               ValueNext; increments CounterPhi by 1 -> CounterNext;
-//               unconditional jump back to LoopBB.
-//   ExitBB:     receives VARSHIFTPSEUDO's original successors; copies
-//               ValuePhi (the value as of the moment the counter reached
-//               the requested amount) into the pseudo's original
-//               destination register.
+//   amount >> 1, C=bit0 ? shift x 1 time
+//   amount >> 1, C=bit1 ? shift x 2 times
+//   ...
+//   amount >> 1, C=bit4 ? shift x 16 times
+//
+// That is ten instructions of tests plus exactly N shifts, against five or so
+// instructions per shift for a counting loop, and it examines only the bits
+// that exist: an amount outside 0-31 is poison in IR, and this behaves as if
+// the amount were masked to five bits rather than spinning. An earlier
+// counting loop compared against the raw amount and, handed -1, ran about
+// four billion times - clang turns `c ? x >> (s - 12) : x << (12 - s)` into a
+// select over both shifts, and Linux's alloc_large_system_hash is exactly
+// that.
+//
+// Blocks (BB is VARSHIFTPSEUDO's parent block, split at the pseudo), for each
+// bit k from 0 to 4:
+//   TestBB_k:  amount >>= 1; C clear jumps to MergeBB_k (TestBB_0 is BB).
+//   ShiftBB_k: 2^k single-bit shifts of the value; falls through.
+//   MergeBB_k: PHI of the value with and without those shifts; it is also
+//              TestBB_(k+1), and MergeBB_4 receives the pseudo's original
+//              successors and copies the value into its destination.
 //===----------------------------------------------------------------------===//
 
 MachineBasicBlock *MoeTargetLowering::emitVarShift(MachineInstr &MI,
@@ -1365,61 +1337,72 @@ MachineBasicBlock *MoeTargetLowering::emitVarShift(MachineInstr &MI,
 
   const BasicBlock *LLVM_BB = BB->getBasicBlock();
   MachineFunction::iterator InsertPt = ++BB->getIterator();
-  MachineBasicBlock *LoopBB = MF->CreateMachineBasicBlock(LLVM_BB);
-  MachineBasicBlock *ContinueBB = MF->CreateMachineBasicBlock(LLVM_BB);
-  MachineBasicBlock *ExitBB = MF->CreateMachineBasicBlock(LLVM_BB);
-  MF->insert(InsertPt, LoopBB);
-  MF->insert(InsertPt, ContinueBB);
-  MF->insert(InsertPt, ExitBB);
+
+  MachineBasicBlock *ShiftBBs[5], *MergeBBs[5];
+  for (unsigned K = 0; K < 5; ++K) {
+    ShiftBBs[K] = MF->CreateMachineBasicBlock(LLVM_BB);
+    MergeBBs[K] = MF->CreateMachineBasicBlock(LLVM_BB);
+    MF->insert(InsertPt, ShiftBBs[K]);
+    MF->insert(InsertPt, MergeBBs[K]);
+  }
+  MachineBasicBlock *ExitBB = MergeBBs[4];
 
   ExitBB->splice(ExitBB->begin(), BB,
                  std::next(MachineBasicBlock::iterator(MI)), BB->end());
   ExitBB->transferSuccessorsAndUpdatePHIs(BB);
 
-  BB->addSuccessor(LoopBB);
-  LoopBB->addSuccessor(ExitBB);     // counter == amount: done
-  LoopBB->addSuccessor(ContinueBB); // counter != amount: fall through, shift
-  ContinueBB->addSuccessor(LoopBB); // always loop back
+  Register Value = MRI.createVirtualRegister(RC);
+  Register Amount = MRI.createVirtualRegister(RC);
+  BuildMI(*BB, MI, DL, TII->get(TargetOpcode::COPY), Value).addReg(ValReg);
+  BuildMI(*BB, MI, DL, TII->get(TargetOpcode::COPY), Amount).addReg(AmtReg);
 
-  Register Value0 = MRI.createVirtualRegister(RC);
-  Register Amt0 = MRI.createVirtualRegister(RC);
-  Register Counter0 = MRI.createVirtualRegister(RC);
+  // Instructions for TestBB_0 go before the pseudo in BB; later tests go at
+  // the end of the previous merge block, after its PHI.
+  MachineBasicBlock *TestBB = BB;
+  for (unsigned K = 0; K < 5; ++K) {
+    MachineBasicBlock *ShiftBB = ShiftBBs[K], *MergeBB = MergeBBs[K];
+    Register AmountNext = MRI.createVirtualRegister(RC);
 
-  Register ValuePhi = MRI.createVirtualRegister(RC);
-  Register CounterPhi = MRI.createVirtualRegister(RC);
-  Register ValueNext = MRI.createVirtualRegister(RC);
-  Register CounterNext = MRI.createVirtualRegister(RC);
+    auto Emit = [&](unsigned Opc, Register Dst) {
+      if (TestBB == BB)
+        return BuildMI(*BB, MI, DL, TII->get(Opc), Dst);
+      return BuildMI(TestBB, DL, TII->get(Opc), Dst);
+    };
+    Emit(Moe::SRL, AmountNext).addReg(Amount);
+    if (TestBB == BB)
+      BuildMI(*BB, MI, DL, TII->get(Moe::JCC))
+          .addMBB(MergeBB)
+          .addImm(MoeCC::COND_CC);
+    else
+      BuildMI(TestBB, DL, TII->get(Moe::JCC))
+          .addMBB(MergeBB)
+          .addImm(MoeCC::COND_CC);
 
-  // BB
-  BuildMI(*BB, MI, DL, TII->get(TargetOpcode::COPY), Value0).addReg(ValReg);
-  BuildMI(*BB, MI, DL, TII->get(TargetOpcode::COPY), Amt0).addReg(AmtReg);
-  BuildMI(*BB, MI, DL, TII->get(Moe::XOR), Counter0)
-      .addReg(Value0)
-      .addReg(Value0);
+    TestBB->addSuccessor(MergeBB);
+    TestBB->addSuccessor(ShiftBB);
+    ShiftBB->addSuccessor(MergeBB);
 
-  // LoopBB
-  BuildMI(LoopBB, DL, TII->get(TargetOpcode::PHI), ValuePhi)
-      .addReg(Value0).addMBB(BB)
-      .addReg(ValueNext).addMBB(ContinueBB);
-  BuildMI(LoopBB, DL, TII->get(TargetOpcode::PHI), CounterPhi)
-      .addReg(Counter0).addMBB(BB)
-      .addReg(CounterNext).addMBB(ContinueBB);
-  BuildMI(LoopBB, DL, TII->get(Moe::SUBcmp)).addReg(CounterPhi).addReg(Amt0);
-  BuildMI(LoopBB, DL, TII->get(Moe::JCC))
-      .addMBB(ExitBB)
-      .addImm(MoeCC::COND_EQ);
+    Register Shifted = Value;
+    for (unsigned I = 0; I < (1u << K); ++I) {
+      Register Next = MRI.createVirtualRegister(RC);
+      BuildMI(ShiftBB, DL, TII->get(ShiftOpc), Next).addReg(Shifted);
+      Shifted = Next;
+    }
 
-  // ContinueBB
-  BuildMI(ContinueBB, DL, TII->get(ShiftOpc), ValueNext).addReg(ValuePhi);
-  BuildMI(ContinueBB, DL, TII->get(Moe::INCREMENT), CounterNext)
-      .addReg(CounterPhi)
-      .addImm(1);
-  BuildMI(ContinueBB, DL, TII->get(Moe::JMP)).addMBB(LoopBB);
+    Register Merged = MRI.createVirtualRegister(RC);
+    BuildMI(*MergeBB, MergeBB->begin(), DL, TII->get(TargetOpcode::PHI), Merged)
+        .addReg(Value).addMBB(TestBB)
+        .addReg(Shifted).addMBB(ShiftBB);
 
-  // ExitBB: LoopBB is ExitBB's only predecessor, so a plain COPY suffices -
-  // no PHI needed for a single incoming value.
-  BuildMI(*ExitBB, ExitBB->begin(), DL, TII->get(TargetOpcode::COPY), DstReg)
-      .addReg(ValuePhi);
+    Value = Merged;
+    Amount = AmountNext;
+    TestBB = MergeBB;
+  }
+
+  // The PHI is ExitBB's first instruction; the copy goes right after it.
+  BuildMI(*ExitBB, std::next(ExitBB->begin()), DL,
+          TII->get(TargetOpcode::COPY), DstReg)
+      .addReg(Value);
 
   MI.eraseFromParent();
   return ExitBB;
