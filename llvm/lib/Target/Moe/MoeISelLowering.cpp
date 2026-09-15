@@ -464,9 +464,20 @@ SDValue MoeTargetLowering::LowerShifts(SDValue Op, SelectionDAG &DAG) const {
     // node (bypassing SelectionDAG pattern matching, same as LowerMUL),
     // expanded into a real runtime loop by emitVarShift after instruction
     // selection.
+    //
+    // The amount is masked to 0-31 first. An out-of-range amount is poison
+    // in IR, so any result is correct - but a loop that counts up to the raw
+    // amount spins about four billion times for an amount of -1, and that is
+    // not a wrong answer, it is a hang. It is also not hypothetical: clang
+    // turns `c ? x >> (s - 12) : x << (12 - s)` into a select over both
+    // shifts, so the unselected one runs with a negative amount on every
+    // call. Linux's alloc_large_system_hash does exactly that.
     SDValue OpcConst = DAG.getTargetConstant(RealOpc, dl, MVT::i32);
+    SDValue Mask = DAG.getConstant(VT.getSizeInBits() - 1, dl, MVT::i32);
+    SDValue MaskedAmt = DAG.getNode(ISD::AND, dl, MVT::i32, N->getOperand(1),
+                                    Mask);
     return SDValue(DAG.getMachineNode(Moe::VARSHIFTPSEUDO, dl, VT,
-                                       N->getOperand(0), N->getOperand(1),
+                                       N->getOperand(0), MaskedAmt,
                                        OpcConst),
                    0);
   }
