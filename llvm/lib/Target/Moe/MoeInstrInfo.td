@@ -398,6 +398,48 @@ def JMPabs : JumpForm<0b00, (outs), (ins calltarget:$dst), "jump.al $dst", []> {
 }
 
 //===----------------------------------------------------------------------===//
+// SYSCALL (0b0001) / IRET (0b0010) / INVALIDATE (0b0011) - the three
+// operand-less control-transfer instructions, using MoeInstrFormats.td's
+// NoOperandForm. None of them is ever produced by instruction selection:
+// there is no C-level construct that lowers to a trap entry, a trap return
+// or a translation-cache flush, so none has a Pattern and none appears in
+// MoeISelLowering. They exist purely so hand-written supervisor assembly
+// (the kernel's head.S/entry.S, and llvm-tests' supervisor/paging tests)
+// can be assembled at all - before this, `syscall`/`iret`/`invalidate` were
+// not defined anywhere in the backend and every one of them is needed by
+// the first few lines of any trap vector.
+//
+// Flags are set honestly rather than defensively, since machine passes act
+// on them:
+//  - All three have side effects nothing in their Defs/Uses can express
+//    (SYSCALL diverts control to the trap vector; INVALIDATE drops the
+//    translation cache, which is invisible to every memory-dependence
+//    analysis LLVM has), so hasSideEffects blocks deletion and reordering
+//    across them - the same idiom SUBcmp and the SHIFT family already use
+//    here for the same reason.
+//  - IRET is a return, a terminator and a barrier: it restores IA from RA,
+//    so nothing after it in its block is reachable.
+//  - SYSCALL is deliberately NOT a barrier: architecturally the handler's
+//    own IRET resumes at the instruction after it (see 'Traps'), so control
+//    falls through, exactly as it does for an ordinary call.
+//===----------------------------------------------------------------------===//
+
+let hasSideEffects = 1 in {
+
+// Trap entry writes RA/RF/IFS and updates F (see the 5-step sequence in
+// 'Trap entry' in the Traps chapter); IA becomes the trap vector.
+let Defs = [IA, F, RA, RF, IFS] in
+def SYSCALL : NoOperandForm<0b0001, "syscall", []>;
+
+let isReturn = 1, isTerminator = 1, isBarrier = 1, Uses = [RA, RF],
+    Defs = [IA, F] in
+def IRET : NoOperandForm<0b0010, "iret", []>;
+
+def INVALIDATE : NoOperandForm<0b0011, "invalidate", []>;
+
+} // hasSideEffects
+
+//===----------------------------------------------------------------------===//
 // PUSH (0b0111) / POP (0b1000) - full-descending stack. Used directly (not
 // through generic patterns) by the call/return sequence and by
 // MoeFrameLowering's callee-saved register save/restore - see the

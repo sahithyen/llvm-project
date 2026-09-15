@@ -10,14 +10,17 @@
 //
 // Every instruction's 16-bit opcode halfword is produced by the
 // TableGen-generated getBinaryCodeForInstr (from the `Inst` bit layouts in
-// MoeInstrFormats.td). JUMP/LOAD/STORE's trailing operand word is NOT part
-// of `Inst` at all (no operand referencing it has a `let Inst{...} = ...`
-// assignment - see 'Addressing mode' in the Encoding chapter), so it's
-// hand-emitted here instead of through the generated tables, including the
-// alignment-padding rule: the trailing word must land on the next
-// word-aligned address after the instruction, which requires tracking each
-// function's running byte offset from its (guaranteed, see
-// MoeISelLowering's setMinFunctionAlignment) word-aligned start.
+// MoeInstrFormats.td), and that halfword is all this emitter produces.
+//
+// JUMP/LOAD/STORE's trailing operand word is NOT part of `Inst` at all (no
+// operand referencing it has a `let Inst{...} = ...` assignment - see
+// 'Addressing mode' in the Encoding chapter) and is not emitted here either:
+// it must land on the next word-aligned address after the opcode halfword,
+// and whether that costs padding depends on the halfword's own position,
+// which an MCCodeEmitter is not told and which layout has not decided yet.
+// MoeELFStreamer emits it instead, as an alignment directive plus a 4-byte
+// value - see that file's comment for the concrete miscompile that motivated
+// moving it there.
 //
 //===----------------------------------------------------------------------===//
 
@@ -42,12 +45,6 @@ class MoeMCCodeEmitter : public MCCodeEmitter {
   MCContext &Ctx;
   MCInstrInfo const &MCII;
 
-  // Bytes emitted since the current function's (word-aligned) start - see
-  // MoeAsmPrinter::emitFunctionBodyStart, which resets this via
-  // resetMoeCodeEmitterOffset. Only its value mod 4 matters; kept as a full
-  // count for debuggability.
-  mutable uint64_t CurrentFunctionOffset = 0;
-
   uint64_t getBinaryCodeForInstr(const MCInst &MI,
                                  SmallVectorImpl<MCFixup> &Fixups,
                                  const MCSubtargetInfo &STI) const;
@@ -56,9 +53,6 @@ class MoeMCCodeEmitter : public MCCodeEmitter {
                              SmallVectorImpl<MCFixup> &Fixups,
                              const MCSubtargetInfo &STI) const;
 
-  void emitTrailingWord(const MCInst &MI, SmallVectorImpl<char> &CB,
-                        SmallVectorImpl<MCFixup> &Fixups) const;
-
 public:
   MoeMCCodeEmitter(MCContext &ctx, MCInstrInfo const &MCII)
       : Ctx(ctx), MCII(MCII) {}
@@ -66,8 +60,6 @@ public:
   void encodeInstruction(const MCInst &MI, SmallVectorImpl<char> &CB,
                          SmallVectorImpl<MCFixup> &Fixups,
                          const MCSubtargetInfo &STI) const override;
-
-  void resetFunctionOffset() const { CurrentFunctionOffset = 0; }
 };
 } // end anonymous namespace
 
@@ -77,83 +69,6 @@ void MoeMCCodeEmitter::encodeInstruction(const MCInst &MI,
                                           const MCSubtargetInfo &STI) const {
   uint64_t Bits = getBinaryCodeForInstr(MI, Fixups, STI);
   support::endian::write(CB, (uint16_t)Bits, llvm::endianness::little);
-  CurrentFunctionOffset += 2;
-
-  emitTrailingWord(MI, CB, Fixups);
-}
-
-void MoeMCCodeEmitter::emitTrailingWord(const MCInst &MI,
-                                        SmallVectorImpl<char> &CB,
-                                        SmallVectorImpl<MCFixup> &Fixups) const {
-  // Which operand holds the trailing word's addressing info, and its
-  // shape: a single symbol-valued operand (Absolute mode - moeaddr/
-  // jmptarget/calltarget), or a (base register, offset immediate) pair
-  // (Register-indirect mode - moemem, no relocation, just a packed value).
-  int SymOperand = -1;
-  int MemBaseOperand = -1;
-
-  switch (MI.getOpcode()) {
-  case Moe::JMP:
-  case Moe::JCC:
-  case Moe::JMPabs:
-    SymOperand = 0;
-    break;
-  case Moe::LOADabs:
-  case Moe::STOREabs:
-    SymOperand = 1;
-    break;
-  case Moe::LOADrr:
-  case Moe::STORErr:
-  // STORErr_B/H have the same (ins GPR:$reg, moemem:$addr) shape as
-  // STORErr - no tied operand - so the base register is still operand 1.
-  case Moe::STORErr_B:
-  case Moe::STORErr_H:
-    MemBaseOperand = 1;
-    break;
-  // LOADrr_B/H additionally have a tied $oldval input ((ins GPR:$oldval,
-  // moemem:$addr)) ahead of the address, which remains a distinct MCInst
-  // operand despite the tie (ties only constrain register allocation, they
-  // don't collapse the operand at the MC level) - shifting the base
-  // register to operand 2, not 1.
-  case Moe::LOADrr_B:
-  case Moe::LOADrr_H:
-    MemBaseOperand = 2;
-    break;
-  default:
-    return; // No trailing operand for this instruction.
-  }
-
-  // Bytes appended by this call so far (relative to this encodeInstruction
-  // invocation, which is what MCFixup offsets must be relative to - the
-  // streamer adds this fragment's own base offset automatically).
-  uint32_t LocalOffset = 2;
-
-  if ((CurrentFunctionOffset % 4) != 0) {
-    support::endian::write(CB, (uint16_t)0, llvm::endianness::little);
-    LocalOffset += 2;
-    CurrentFunctionOffset += 2;
-  }
-
-  if (SymOperand >= 0) {
-    const MCOperand &MO = MI.getOperand(SymOperand);
-    assert(MO.isExpr() &&
-           "Absolute-mode trailing operand must be a symbol expression");
-    Fixups.push_back(MCFixup::create(LocalOffset, MO.getExpr(), FK_Data_4));
-    support::endian::write(CB, (uint32_t)0, llvm::endianness::little);
-  } else {
-    const MCOperand &Base = MI.getOperand(MemBaseOperand);
-    const MCOperand &Offset = MI.getOperand(MemBaseOperand + 1);
-    assert(Base.isReg() && Offset.isImm() &&
-           "Register-indirect trailing operand must be (reg, imm)");
-    uint32_t BaseEnc = Ctx.getRegisterInfo()->getEncodingValue(Base.getReg());
-    // Matches emulator/src/cpu.rs's resolve_trailing_operand exactly: base
-    // register select in bits 3-0, 28-bit signed offset in bits 31-4.
-    uint32_t Packed = (static_cast<uint32_t>(Offset.getImm()) << 4) |
-                       (BaseEnc & 0xF);
-    support::endian::write(CB, Packed, llvm::endianness::little);
-  }
-
-  CurrentFunctionOffset += 4;
 }
 
 unsigned MoeMCCodeEmitter::getMachineOpValue(const MCInst &MI,
@@ -165,7 +80,8 @@ unsigned MoeMCCodeEmitter::getMachineOpValue(const MCInst &MI,
 
   // Every operand actually assigned into `Inst` (see MoeInstrFormats.td) is
   // either a register or a plain immediate - no Inst-bound field is ever a
-  // symbol (those all live in the hand-emitted trailing word above).
+  // symbol (those all live in the trailing word, emitted by
+  // MoeELFStreamer).
   assert(MO.isImm() && "Expected register or immediate for an Inst-bound field");
   return static_cast<unsigned>(MO.getImm());
 }
@@ -173,10 +89,6 @@ unsigned MoeMCCodeEmitter::getMachineOpValue(const MCInst &MI,
 MCCodeEmitter *llvm::createMoeMCCodeEmitter(const MCInstrInfo &MCII,
                                              MCContext &Ctx) {
   return new MoeMCCodeEmitter(Ctx, MCII);
-}
-
-void llvm::resetMoeCodeEmitterOffset(MCCodeEmitter &MCE) {
-  static_cast<MoeMCCodeEmitter &>(MCE).resetFunctionOffset();
 }
 
 #include "MoeGenMCCodeEmitter.inc"

@@ -12,19 +12,27 @@
 // the only mode this project uses - there's no external `as`), so inline
 // asm was never independently reachable before this existed.
 //
-// Scope, documented rather than silently assumed: covers register/immediate/
-// [reg+offset]-memory operand instructions (MOVE, ADD, SUB, AND, OR, XOR,
-// INCREMENT, LOAD/STORE's register-indirect form) via the standard
+// Scope: covers register/immediate/[reg+offset]-memory operand instructions
+// (MOVE, ADD, SUB, AND, OR, XOR, INCREMENT, LOAD/STORE's register-indirect
+// form) and the operand-less SYSCALL/IRET/INVALIDATE via the standard
 // TableGen-generated matcher - modeled on MSP430AsmParser.cpp, the closest
-// real in-tree precedent for a small, regular instruction set. Conditional/
-// unconditional jump mnemonics (JMP/JCC's shared "jump.$cond $dst" printed
-// form) are NOT covered: unlike every other instruction's fixed-literal
-// mnemonic, that one embeds a substituted operand directly in the mnemonic
-// text itself, which - confirmed by reading MSP430's own AsmParser, a real,
-// mature in-tree target that hits the exact same shape for its own "jXX"
-// conditional jumps - needs hand-written mnemonic-splitting special-case
-// parsing, not something the generic matcher handles automatically. Left
-// for a follow-up rather than expanding this milestone's scope further.
+// real in-tree precedent for a small, regular instruction set.
+//
+// JCC's "jump.$cond $dst" printed form is the one shape the generic matcher
+// cannot handle on its own, and parseCondBranch below is the hand-written
+// special case for it. Unlike every other instruction's fixed-literal
+// mnemonic, that one substitutes an operand directly into the mnemonic text,
+// so TableGen's matcher table ends up keyed on the bare prefix "jump."
+// (confirmed by reading the generated MoeGenAsmMatcher.inc: JCC's entry is
+// { "jump.", { MCK_Imm, MCK_Imm } }, condition first, target second) with no
+// way to reach it from a whole mnemonic token. MSP430's own AsmParser hits
+// the identical shape for its "jXX" conditional jumps and solves it the same
+// way, in MSP430AsmParser::parseJccInstruction.
+//
+// Note that the unconditional form was never affected: JMP/JMPabs's AsmString
+// is the fixed literal "jump.al $dst", so `jump.al <symbol>` has always
+// assembled through the ordinary matcher path. Only the conditional forms
+// needed this.
 //===----------------------------------------------------------------------===//
 
 #include "MCTargetDesc/MoeMCTargetDesc.h"
@@ -41,8 +49,11 @@
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Compiler.h"
+
+#include <optional>
 
 using namespace llvm;
 
@@ -150,6 +161,9 @@ class MoeAsmParser : public MCTargetAsmParser {
 
   bool parseOperand(OperandVector &Operands);
 
+  ParseStatus parseCondBranch(StringRef Name, SMLoc NameLoc,
+                              OperandVector &Operands);
+
   MCAsmParser &getParser() const { return Parser; }
   AsmLexer &getLexer() const { return Parser.getLexer(); }
 
@@ -162,6 +176,16 @@ public:
       : MCTargetAsmParser(Options, STI, MII), Parser(Parser) {
     MCAsmParserExtension::Initialize(Parser);
     setAvailableFeatures(ComputeAvailableFeatures(STI.getFeatureBits()));
+
+    // `.word` is a 32-bit datum on Moe (words are 32 bits - see 'Size
+    // selection' in the Encoding chapter), so it aliases .4byte rather than
+    // .2byte. The generic AsmParser has no built-in .word at all; every
+    // target that wants one registers it here, and which width it means is
+    // genuinely per-target (compare X86's ".word" -> ".2byte" with RISCV's
+    // and AArch64's ".word" -> ".4byte"). Without this, essentially every
+    // piece of assembly carried over from another architecture's tree fails
+    // on its first data item.
+    Parser.addAliasForDirective(".word", ".4byte");
   }
 };
 
@@ -252,8 +276,83 @@ bool MoeAsmParser::parseOperand(OperandVector &Operands) {
   return false;
 }
 
+// Maps a `jump.<cond>` suffix to its 4-bit Condition field value. Names and
+// numbering come from 'Condition selection' in the Encoding chapter, and are
+// the same set MoeInstPrinter::printCCOperand prints and
+// emulator/src/disassembler.rs's condition_name() produces.
+//
+// The suffix is matched case-insensitively for one concrete reason: llc's own
+// output goes through printCCOperand, which prints the condition in UPPERCASE
+// ("jump.EQ .LBB0_1") while every fixed-literal mnemonic in this backend is
+// lowercase. Both spellings therefore have to assemble - llc's existing output
+// unchanged (the constraint on this change: the printed form is shared with
+// the compiler's own emission path), and the lowercase spelling a human
+// writing head.S would naturally reach for.
+static std::optional<unsigned> matchCondCode(StringRef Suffix) {
+  return StringSwitch<std::optional<unsigned>>(Suffix.lower())
+      .Case("al", 0)
+      .Case("nv", 1)
+      .Case("eq", 2)
+      .Case("ne", 3)
+      .Case("cs", 4)
+      .Case("cc", 5)
+      .Case("mi", 6)
+      .Case("pl", 7)
+      .Case("vs", 8)
+      .Case("vc", 9)
+      .Case("hi", 10)
+      .Case("ls", 11)
+      .Case("ge", 12)
+      .Case("lt", 13)
+      .Case("gt", 14)
+      .Case("le", 15)
+      .Default(std::nullopt);
+}
+
+// Builds JCC's operand list for a `jump.<cond> <target>` mnemonic.
+// NoMatch means this wasn't a conditional-jump mnemonic at all and Operands
+// is untouched, so the caller falls through to the ordinary matcher path.
+//
+// The operand order here is not arbitrary, and it is not JCC's (ins) order:
+// the TableGen matcher table keys this instruction on the bare "jump." prefix
+// and then expects the tokens in the order they appear in the AsmString
+// "jump.$cond $dst" - condition first, target second - converting them back
+// into MCInst operand order ($dst, $cond) itself.
+ParseStatus MoeAsmParser::parseCondBranch(StringRef Name, SMLoc NameLoc,
+                                           OperandVector &Operands) {
+  if (!Name.starts_with_insensitive("jump."))
+    return ParseStatus::NoMatch;
+
+  StringRef Suffix = Name.substr(5);
+  // `jump.al` stays on the ordinary path: it is a real fixed-literal mnemonic
+  // of its own (JMP/JMPabs), which is what llc emits for an unconditional
+  // branch and what the existing tests assemble. Routing it through JCC with
+  // cond=0 would produce a byte-identical encoding, but would needlessly move
+  // a working path onto a new one.
+  if (Suffix.equals_insensitive("al"))
+    return ParseStatus::NoMatch;
+
+  std::optional<unsigned> CC = matchCondCode(Suffix);
+  if (!CC)
+    return ParseStatus::NoMatch; // Let the matcher report the bad mnemonic.
+
+  Operands.push_back(MoeOperand::CreateToken(Name.take_front(5), NameLoc));
+  Operands.push_back(MoeOperand::CreateImm(
+      MCConstantExpr::create(*CC, getContext()), NameLoc, NameLoc));
+
+  if (parseOperand(Operands))
+    return ParseStatus::Failure;
+  if (getLexer().isNot(AsmToken::EndOfStatement))
+    return Error(getLexer().getLoc(), "unexpected token in operand list");
+  return ParseStatus::Success;
+}
+
 bool MoeAsmParser::parseInstruction(ParseInstructionInfo &Info, StringRef Name,
                                      SMLoc NameLoc, OperandVector &Operands) {
+  ParseStatus CondBranch = parseCondBranch(Name, NameLoc, Operands);
+  if (!CondBranch.isNoMatch())
+    return CondBranch.isFailure();
+
   Operands.push_back(MoeOperand::CreateToken(Name, NameLoc));
 
   if (getLexer().is(AsmToken::EndOfStatement))
