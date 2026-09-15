@@ -52,6 +52,8 @@ public:
   // MoeTargetLowering::getRegForInlineAsmConstraint's "r"-only scope.
   bool PrintAsmOperand(const MachineInstr *MI, unsigned OpNo,
                        const char *ExtraCode, raw_ostream &O) override;
+  bool PrintAsmMemoryOperand(const MachineInstr *MI, unsigned OpNo,
+                             const char *ExtraCode, raw_ostream &O) override;
   void printOperand(const MachineInstr *MI, unsigned OpNo, raw_ostream &O);
 
   static char ID;
@@ -63,6 +65,25 @@ bool MoeAsmPrinter::PrintAsmOperand(const MachineInstr *MI, unsigned OpNo,
   if (ExtraCode && ExtraCode[0])
     return AsmPrinter::PrintAsmOperand(MI, OpNo, ExtraCode, O);
   printOperand(MI, OpNo, O);
+  return false;
+}
+
+// The printing half of the "m" constraint - see
+// MoeDAGToDAGISel::SelectInlineAsmMemoryOperand, which produces the (base
+// register, offset) pair this prints. The syntax has to be exactly what
+// MoeInstPrinter::printMemOperand emits and what MoeAsmParser accepts, since
+// the text goes straight back through the integrated assembler.
+bool MoeAsmPrinter::PrintAsmMemoryOperand(const MachineInstr *MI, unsigned OpNo,
+                                           const char *ExtraCode,
+                                           raw_ostream &O) {
+  if (ExtraCode && ExtraCode[0])
+    return true; // Unknown modifier.
+  const MachineOperand &Base = MI->getOperand(OpNo);
+  const MachineOperand &Disp = MI->getOperand(OpNo + 1);
+  if (!Base.isReg() || !Disp.isImm())
+    return true;
+  O << "[" << MoeInstPrinter::getRegisterName(Base.getReg()) << "+"
+    << Disp.getImm() << "]";
   return false;
 }
 

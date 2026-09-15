@@ -136,6 +136,20 @@ MoeTargetLowering::MoeTargetLowering(const TargetMachine &TM,
   // (datalayout bakes i64 in at i64:32, matching the DoubleWidth=32
   // TargetInfo collapse), unlike e.g. Sparc's VAARG Custom-lowering, needed
   // there only for 8-byte-aligned doubles.
+  // Variable-sized stack objects (alloca with a runtime size, and C99 VLAs)
+  // are rejected rather than lowered. The generic expansion is a plain "SP -=
+  // size", which on Moe silently destroys the function: there is no frame
+  // pointer (see MoeFrameLowering::hasFPImpl), so nothing ever puts SP back,
+  // and the epilogue's POP then reads the return address from inside the
+  // allocation and returns to garbage. Confirmed by looking at the generated
+  // code - the SP adjustment appears and no matching restore ever does.
+  //
+  // Supporting it properly means a frame pointer, which costs one of only six
+  // allocatable registers (GP4/GP5 are reserved scratch) for a feature the
+  // Linux kernel forbids in its own code anyway. Until something needs it, a
+  // diagnostic is strictly better than a wrong answer.
+  setOperationAction(ISD::DYNAMIC_STACKALLOC, MVT::i32, Custom);
+
   setOperationAction(ISD::VASTART, MVT::Other, Custom);
   setOperationAction(ISD::VAARG, MVT::Other, Expand);
   // va_end is a no-op for a plain-pointer va_list (nothing to release).
@@ -190,6 +204,11 @@ SDValue MoeTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
     return LowerSELECT_CC(Op, DAG);
   case ISD::VASTART:
     return LowerVASTART(Op, DAG);
+  case ISD::DYNAMIC_STACKALLOC:
+    report_fatal_error("Moe: variable-sized stack allocation (alloca with a "
+                       "runtime size, or a C99 variable-length array) is not "
+                       "supported - there is no frame pointer to restore SP "
+                       "from afterwards. See psabi.md's stack section.");
   case ISD::MUL:
     return LowerMUL(Op, DAG);
   case ISD::UDIV:
@@ -615,58 +634,21 @@ SDValue MoeTargetLowering::LowerFormalArguments(
     }
   }
 
-  // Variadic functions (Milestone 14): spill whichever of GP0-3 named
-  // arguments didn't consume into a register-save area, so va_arg's fully
-  // generic pointer-walking expansion (see the VASTART/VAARG
-  // setOperationAction comment above) can read them contiguously starting
-  // from LowerVASTART's initial pointer.
-  //
-  // Deliberate, documented scope cut: this only covers the up-to-4-total-
-  // arguments case (named + variadic together) - real overflow variadic
-  // arguments (a 5th+ total argument, stack-passed by LowerCall's existing,
-  // unmodified convention) are NOT reachable by continuing to walk past the
-  // register-save area. Making that work would need the register-save area
-  // and the stack-passed-overflow area to be memory-contiguous, but Moe's
-  // entry SP points directly at the just-pushed return address (unlike e.g.
-  // Sparc's register-window ABI, which reserves fixed, args-independent
-  // stack space for every possible register argument) - the return address
-  // occupies exactly the 4 bytes that would need to sit between the two
-  // areas, and there is no way to skip over it with a plain, uniform
-  // pointer-plus-size VAARG expansion. Solving this needs real ABI work
-  // (e.g. always stack-passing variadic arguments), out of scope here - a
-  // variadic function called with more than 4 total arguments will read
-  // back garbage for the 5th and later, not silently or loudly fail.
   if (isVarArg) {
-    static const MCPhysReg ArgRegs[] = {Moe::GP0, Moe::GP1, Moe::GP2,
-                                         Moe::GP3};
-    unsigned NumConsumed = CCInfo.getFirstUnallocated(ArgRegs);
-    unsigned NumToSave = 4 - NumConsumed;
-
-    // Always create this (even a 0-size object, if every register was
-    // consumed by named parameters) so LowerVASTART always has a valid
-    // frame index to reference - a variadic function is always a valid
-    // va_start target regardless of how many named parameters it declares.
+    // Every argument of a variadic function is passed on the stack, named ones
+    // included (see CC_Moe for why a register-save area cannot work here), so
+    // the unnamed arguments sit contiguously right after the named ones in the
+    // caller's outgoing area. va_start's pointer is therefore just the first
+    // word past the named parameters, and va_arg is a plain pointer walk -
+    // which is what makes a variadic call with more than four total arguments
+    // work at all. It previously read back garbage from the fifth onwards.
+    //
+    // The +4 is the same one the stack-argument loads above need: entry SP
+    // points at the return address the caller pushed, one word below where its
+    // outgoing arguments start.
     MachineFrameInfo &MFI = MF.getFrameInfo();
-    int VarArgsFI = MFI.CreateStackObject(4 * NumToSave, Align(4), false);
+    int VarArgsFI = MFI.CreateFixedObject(4, CCInfo.getStackSize() + 4, true);
     MF.getInfo<MoeMachineFunctionInfo>()->setVarArgsFrameIndex(VarArgsFI);
-
-    if (NumToSave > 0) {
-      SmallVector<SDValue, 4> OutChains;
-      for (unsigned i = NumConsumed; i != 4; ++i) {
-        Register VReg = RegInfo.createVirtualRegister(&Moe::GPRRegClass);
-        RegInfo.addLiveIn(ArgRegs[i], VReg);
-        SDValue ArgValue = DAG.getCopyFromReg(Chain, dl, VReg, MVT::i32);
-
-        SDValue FIN = DAG.getFrameIndex(VarArgsFI,
-                                         getFrameIndexTy(DAG.getDataLayout()));
-        SDValue Offset =
-            DAG.getNode(ISD::ADD, dl, getFrameIndexTy(DAG.getDataLayout()),
-                        FIN, DAG.getIntPtrConstant(4 * (i - NumConsumed), dl));
-        OutChains.push_back(
-            DAG.getStore(Chain, dl, ArgValue, Offset, MachinePointerInfo()));
-      }
-      Chain = DAG.getNode(ISD::TokenFactor, dl, MVT::Other, OutChains);
-    }
   }
 
   return Chain;

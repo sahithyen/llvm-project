@@ -64,3 +64,21 @@ def GPR : RegisterClass<"Moe", [i32], 32,
 // hand-built MOVE MachineInstrs with fixed physical registers.
 def AllReg : RegisterClass<"Moe", [i32], 32,
   (add GPR, IA, SP, TT, F, IM, IFS, RA, RF)>;
+
+// Register-indirect addressing's base register, which is its own encoding:
+// 'Base register selection' in the Encoding chapter admits values 0-11 -
+// GP0-GP7 plus IA, SP, TT and F - and reserves 12-15, because a fault on an
+// access through IM, IFS, RA or RF could not be diagnosed (trap entry has
+// already destroyed all four by the time a handler runs).
+//
+// SP in particular is not optional here. Every frame-relative access this
+// backend emits is `[sp+offset]`, so without SP in this class llc's own
+// -filetype=asm output could not be fed back through llvm-mc, and neither
+// could an inline-asm "m" operand naming a stack object.
+//
+// Like AllReg, this is wider than what the register allocator ever hands out:
+// IA, SP, TT and F are all permanently reserved (see
+// MoeRegisterInfo::getReservedRegs), so widening the operand class admits the
+// spellings the ISA allows without admitting them as allocation candidates.
+def BaseReg : RegisterClass<"Moe", [i32], 32,
+  (add GPR, IA, SP, TT, F)>;

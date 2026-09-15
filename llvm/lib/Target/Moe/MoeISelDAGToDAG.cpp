@@ -43,6 +43,10 @@ public:
   // Milestone 1 plan's "Frame-index elimination and spills" section.
   bool SelectAddr(SDValue Addr, SDValue &Base, SDValue &Disp);
 
+  bool SelectInlineAsmMemoryOperand(const SDValue &Op,
+                                    InlineAsm::ConstraintCode ConstraintID,
+                                    std::vector<SDValue> &OutOps) override;
+
 #include "MoeGenDAGISel.inc"
 };
 
@@ -101,6 +105,43 @@ bool MoeDAGToDAGISel::SelectAddr(SDValue Addr, SDValue &Base, SDValue &Disp) {
   Base = Addr;
   Disp = CurDAG->getTargetConstant(0, SDLoc(Addr), MVT::i32);
   return true;
+}
+
+// The "m" inline-asm constraint. Without this, any asm operand constrained "m"
+// aborts instruction selection outright ("Could not match memory address.
+// Inline asm failure!"), because the generic
+// SelectionDAGISel::SelectInlineAsmMemoryOperands has no target-independent way
+// to turn an address into operands the target's printer understands.
+//
+// This matters well beyond convenience: Linux uses "m" pervasively in its
+// uaccess, bitops and atomic headers, so a kernel port cannot get far without
+// it. Moe has exactly one memory-operand shape - Register-indirect's (base
+// register, offset) pair, see moemem in MoeInstrInfo.td - and SelectAddr
+// already produces it for ordinary loads and stores, including folding a
+// constant offset and handing back a frame index for a stack object (which
+// MoeRegisterInfo::eliminateFrameIndex then rewrites in place, exactly as it
+// does for LOADrr/STORErr, since the operand pair sits adjacent here too).
+bool MoeDAGToDAGISel::SelectInlineAsmMemoryOperand(
+    const SDValue &Op, InlineAsm::ConstraintCode ConstraintID,
+    std::vector<SDValue> &OutOps) {
+  switch (ConstraintID) {
+  case InlineAsm::ConstraintCode::m:
+  // "o" is "m" restricted to an offsettable address. Every address Moe can
+  // express IS offsettable - the offset is a 28-bit field in the trailing
+  // operand word, not part of the instruction - so the two are the same here.
+  case InlineAsm::ConstraintCode::o: {
+    SDValue Base, Disp;
+    if (!SelectAddr(Op, Base, Disp))
+      return true;
+    OutOps.push_back(Base);
+    OutOps.push_back(Disp);
+    return false;
+  }
+  default:
+    // Anything else (including "X", which clang can hand down for an operand
+    // it could not classify) is reported unhandled rather than guessed at.
+    return true;
+  }
 }
 
 void MoeDAGToDAGISel::Select(SDNode *Node) {

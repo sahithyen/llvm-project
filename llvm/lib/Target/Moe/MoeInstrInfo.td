@@ -478,9 +478,13 @@ def STOREabs : LoadStoreForm<0b0110, 0b00, (outs), (ins GPR:$reg, moeaddr:$addr)
 // moemem's base/offset are carried as ordinary MachineOperands for now.
 //===----------------------------------------------------------------------===//
 
+// The base register is BaseReg, not GPR: 'Base register selection' in the
+// Encoding chapter admits GP0-GP7, IA, SP, TT and F. SP matters most - every
+// frame-relative access is `[sp+offset]` - and with GPR here the assembler
+// rejected exactly the text llc itself emits.
 def moemem : Operand<i32> {
   let PrintMethod = "printMemOperand";
-  let MIOperandInfo = (ops GPR, i32imm);
+  let MIOperandInfo = (ops BaseReg, i32imm);
 }
 
 def moeaddr_ri : ComplexPattern<i32, 2, "SelectAddr", [], []>;
