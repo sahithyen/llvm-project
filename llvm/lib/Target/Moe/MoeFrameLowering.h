@@ -48,6 +48,9 @@ public:
                                     const TargetRegisterInfo *TRI) const override;
 
   bool hasReservedCallFrame(const MachineFunction &MF) const override;
+
+  void determineCalleeSaves(MachineFunction &MF, BitVector &SavedRegs,
+                            RegScavenger *RS) const override;
 };
 
 } // namespace llvm

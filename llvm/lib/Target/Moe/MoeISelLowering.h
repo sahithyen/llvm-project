@@ -114,6 +114,7 @@ private:
   MachineBasicBlock *emitDivRem(MachineInstr &MI, MachineBasicBlock *BB) const;
   MachineBasicBlock *emitSDivRem(MachineInstr &MI, MachineBasicBlock *BB) const;
   MachineBasicBlock *emitVarShift(MachineInstr &MI, MachineBasicBlock *BB) const;
+  SDValue LowerDYNAMIC_STACKALLOC(SDValue Op, SelectionDAG &DAG) const;
   MachineBasicBlock *emitSetCC(MachineInstr &MI, MachineBasicBlock *BB) const;
   MachineBasicBlock *emitSelectCC(MachineInstr &MI, MachineBasicBlock *BB) const;
   Register emitCondNegate(MachineFunction *MF, MachineRegisterInfo &MRI,

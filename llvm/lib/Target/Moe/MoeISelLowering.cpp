@@ -283,10 +283,7 @@ SDValue MoeTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
   case ISD::VASTART:
     return LowerVASTART(Op, DAG);
   case ISD::DYNAMIC_STACKALLOC:
-    report_fatal_error("Moe: variable-sized stack allocation (alloca with a "
-                       "runtime size, or a C99 variable-length array) is not "
-                       "supported - there is no frame pointer to restore SP "
-                       "from afterwards. See psabi.md's stack section.");
+    return LowerDYNAMIC_STACKALLOC(Op, DAG);
   case ISD::MUL:
     return LowerMUL(Op, DAG);
   case ISD::UDIV:
@@ -433,6 +430,48 @@ SDValue MoeTargetLowering::LowerGlobalAddress(SDValue Op,
 // the Milestone 1 plan's SHIFT notes. Variable-amount shifts aren't needed
 // by Milestone 1's test case and aren't supported yet.
 //===----------------------------------------------------------------------===//
+
+//===----------------------------------------------------------------------===//
+// Variable-sized stack allocation - alloca with a runtime size, and the C99
+// variable-length arrays built on it.
+//
+// SP moves down by the (word-rounded) size and the new SP is the result. What
+// makes that safe is the frame pointer MoeFrameLowering gives exactly the
+// functions that do this: the locals stay addressable from it while SP is
+// somewhere unknown, and the epilogue restores SP from it rather than by
+// adding back a size nothing recorded.
+//
+// This used to be a hard error, on the reasoning that the Linux kernel forbids
+// variable-length arrays in its own code. A libc does not: musl uses them in
+// seven files, execl and getcwd among them, and no amount of psABI wording
+// makes those go away.
+//===----------------------------------------------------------------------===//
+
+SDValue MoeTargetLowering::LowerDYNAMIC_STACKALLOC(SDValue Op,
+                                                    SelectionDAG &DAG) const {
+  SDLoc dl(Op);
+  EVT VT = Op.getValueType();
+  SDValue Chain = Op.getOperand(0);
+  SDValue Size = Op.getOperand(1);
+  MaybeAlign Alignment(Op.getConstantOperandVal(2));
+
+  // The stack is word-aligned at all times (psabi.md), and PUSH/POP move SP by
+  // a word whatever they transfer, so an allocation that left SP misaligned
+  // would break the next call rather than this allocation.
+  Align StackAlign =
+      DAG.getSubtarget().getFrameLowering()->getStackAlign();
+  Align Wanted = std::max(StackAlign, Alignment.valueOrOne());
+
+  SDValue SP = DAG.getCopyFromReg(Chain, dl, Moe::SP, VT);
+  SDValue Allocated = DAG.getNode(ISD::SUB, dl, VT, SP, Size);
+  if (Wanted > Align(1))
+    Allocated = DAG.getNode(
+        ISD::AND, dl, VT, Allocated,
+        DAG.getSignedConstant(-(int64_t)Wanted.value(), dl, VT));
+
+  Chain = DAG.getCopyToReg(SP.getValue(1), dl, Moe::SP, Allocated);
+  return DAG.getMergeValues({Allocated, Chain}, dl);
+}
 
 SDValue MoeTargetLowering::LowerShifts(SDValue Op, SelectionDAG &DAG) const {
   SDNode *N = Op.getNode();

@@ -13,6 +13,7 @@
 #include "MoeRegisterInfo.h"
 #include "MoeFrameLowering.h"
 #include "MoeInstrInfo.h"
+#include "llvm/CodeGen/TargetFrameLowering.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/CodeGen/MachineConstantPool.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
@@ -62,6 +63,12 @@ BitVector MoeRegisterInfo::getReservedRegs(const MachineFunction &MF) const {
   Reserved.set(Moe::GP4);
   Reserved.set(Moe::GP5);
 
+  // GP7 is the frame pointer, but only in the functions that need one - see
+  // MoeFrameLowering::hasFPImpl. Everywhere else it stays a general
+  // callee-saved register.
+  if (MF.getSubtarget().getFrameLowering()->hasFP(MF))
+    Reserved.set(Moe::GP7);
+
   return Reserved;
 }
 
@@ -78,11 +85,10 @@ bool MoeRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
   MachineFunction &MF = *MI.getParent()->getParent();
   int FrameIndex = MI.getOperand(FIOperandNum).getIndex();
 
-  // No frame pointer for Milestone 1 (see getFrameRegister below), so every
-  // frame-index is SP-relative. MoeFrameLowering's prologue always finishes
-  // adjusting SP before any frame-indexed access executes, so the object's
-  // recorded offset plus the total (post-prologue) frame size is exactly
-  // its offset from the current SP. This formula itself needs no fixup for
+  // Frame indices are relative to SP, or to the frame pointer in a function
+  // that has one - and the offset is the same either way, because the frame
+  // pointer is set to exactly the SP the prologue finishes with. The object's
+  // recorded offset plus the total (post-prologue) frame size is that offset. This formula itself needs no fixup for
   // the return address, since it works purely in terms of whatever SPOffset
   // a frame index was created with - but incoming stack-argument fixed
   // objects (see LowerFormalArguments) do need a +4 baked into that
@@ -119,14 +125,15 @@ bool MoeRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
     DebugLoc DL = MI.getDebugLoc();
     Register DstReg = MI.getOperand(0).getReg();
 
+    Register FrameReg = getFrameRegister(MF);
     if (Offset == 0) {
-      BuildMI(MBB, II, DL, TII.get(Moe::MOVE), DstReg).addReg(Moe::SP);
+      BuildMI(MBB, II, DL, TII.get(Moe::MOVE), DstReg).addReg(FrameReg);
     } else {
       Constant *CV = ConstantInt::get(
           Type::getInt32Ty(MF.getFunction().getContext()), (uint64_t)Offset);
       unsigned CPI = MF.getConstantPool()->getConstantPoolIndex(CV, Align(4));
 
-      BuildMI(MBB, II, DL, TII.get(Moe::MOVE), Moe::GP4).addReg(Moe::SP);
+      BuildMI(MBB, II, DL, TII.get(Moe::MOVE), Moe::GP4).addReg(FrameReg);
       BuildMI(MBB, II, DL, TII.get(Moe::LOADabs), Moe::GP5)
           .addConstantPoolIndex(CPI);
       BuildMI(MBB, II, DL, TII.get(Moe::ADD), DstReg)
@@ -137,13 +144,13 @@ bool MoeRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
     return false;
   }
 
-  MI.getOperand(FIOperandNum).ChangeToRegister(Moe::SP, false);
+  MI.getOperand(FIOperandNum).ChangeToRegister(getFrameRegister(MF), false);
   MI.getOperand(FIOperandNum + 1).ChangeToImmediate(Offset);
   return false;
 }
 
 Register MoeRegisterInfo::getFrameRegister(const MachineFunction &MF) const {
-  // No frame pointer for Milestone 1 - see the Milestone 1 plan's ABI
-  // section.
-  return Moe::SP;
+  // GP7 in a function with a variable-sized stack object, SP in every other -
+  // see MoeFrameLowering::hasFPImpl.
+  return MF.getSubtarget().getFrameLowering()->hasFP(MF) ? Moe::GP7 : Moe::SP;
 }

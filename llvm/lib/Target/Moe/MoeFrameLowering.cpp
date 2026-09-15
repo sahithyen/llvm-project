@@ -27,6 +27,7 @@
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/CodeGen/RegisterScavenging.h"
 #include "llvm/IR/Constants.h"
 
 using namespace llvm;
@@ -36,10 +37,29 @@ MoeFrameLowering::MoeFrameLowering(const MoeSubtarget &STI)
                            Align(4)),
       STI(STI), TII(*STI.getInstrInfo()), TRI(STI.getRegisterInfo()) {}
 
+// A frame pointer only where one is unavoidable: a function with a
+// variable-sized stack object moves SP by an amount nothing can recompute, so
+// its locals need a base that does not move, and its epilogue needs somewhere
+// to restore SP from. Everywhere else - which is almost everywhere - the frame
+// stays SP-relative and GP7 stays allocatable. Six allocatable registers is
+// already the tightest thing about this target (psabi.md); spending one of
+// them by default would not be worth it for a feature most functions never
+// use.
 bool MoeFrameLowering::hasFPImpl(const MachineFunction &MF) const {
-  // No frame pointer for Milestone 1 - see the Milestone 1 plan's ABI
-  // section. Dynamic alloca (which would need one) is out of scope.
-  return false;
+  const MachineFrameInfo &MFI = MF.getFrameInfo();
+  return MFI.hasVarSizedObjects() || MFI.isFrameAddressTaken();
+}
+
+// GP7 is the frame pointer when there is one, so it has to be saved and
+// restored like any other callee-saved register - and it is reserved for the
+// whole function (MoeRegisterInfo::getReservedRegs), so the ordinary
+// "was it modified?" scan would not notice it.
+void MoeFrameLowering::determineCalleeSaves(MachineFunction &MF,
+                                            BitVector &SavedRegs,
+                                            RegScavenger *RS) const {
+  TargetFrameLowering::determineCalleeSaves(MF, SavedRegs, RS);
+  if (hasFP(MF))
+    SavedRegs.set(Moe::GP7);
 }
 
 bool MoeFrameLowering::hasReservedCallFrame(const MachineFunction &MF) const {
@@ -101,6 +121,14 @@ void MoeFrameLowering::emitPrologue(MachineFunction &MF,
   if (NumBytes)
     adjustStackPointer(MBB, MBBI, DL, TII, MF, NumBytes,
                         MachineInstr::FrameSetup);
+
+  // The frame pointer is SP as it stands here, once and for all: every local
+  // is at a fixed offset from this point, whatever a later variable-sized
+  // allocation does to SP.
+  if (hasFP(MF))
+    BuildMI(MBB, MBBI, DL, TII.get(Moe::MOVE), Moe::GP7)
+        .addReg(Moe::SP)
+        .setMIFlag(MachineInstr::FrameSetup);
 }
 
 void MoeFrameLowering::emitEpilogue(MachineFunction &MF,
@@ -130,6 +158,17 @@ void MoeFrameLowering::emitEpilogue(MachineFunction &MF,
   }
   MBBI = FirstCSPop;
   DL = MBBI->getDebugLoc();
+
+  // With a frame pointer, SP is wherever the last variable-sized allocation
+  // left it and no fixed amount describes the way back, so it is put back to
+  // the frame pointer first - and then the frame is unwound exactly as it
+  // would be without one, because the frame pointer is the BOTTOM of the
+  // locals, not the top: the callee-saved registers this epilogue is about to
+  // pop are above them.
+  if (hasFP(MF))
+    BuildMI(MBB, MBBI, DL, TII.get(Moe::MOVE), Moe::SP)
+        .addReg(Moe::GP7)
+        .setMIFlag(MachineInstr::FrameDestroy);
 
   if (NumBytes)
     adjustStackPointer(MBB, MBBI, DL, TII, MF, -(int64_t)NumBytes,
