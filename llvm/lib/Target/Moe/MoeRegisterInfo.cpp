@@ -152,5 +152,14 @@ bool MoeRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
 Register MoeRegisterInfo::getFrameRegister(const MachineFunction &MF) const {
   // GP7 in a function with a variable-sized stack object, SP in every other -
   // see MoeFrameLowering::hasFPImpl.
-  return MF.getSubtarget().getFrameLowering()->hasFP(MF) ? Moe::GP7 : Moe::SP;
+  //
+  // A function that only realigns the stack also has a frame pointer, but it
+  // is not the base locals are addressed from: there GP7 records where SP was
+  // *before* the frame was allocated and aligned, purely so the epilogue can
+  // put it back. SP is the base, and it is a fixed one, because a realigning
+  // function is not allowed a variable-sized object (MoeFrameLowering's
+  // prologue rejects the combination).
+  const MachineFrameInfo &MFI = MF.getFrameInfo();
+  bool FPIsBase = MFI.hasVarSizedObjects() || MFI.isFrameAddressTaken();
+  return FPIsBase ? Moe::GP7 : Moe::SP;
 }

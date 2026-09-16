@@ -22,6 +22,10 @@ class MoeFrameLowering : public TargetFrameLowering {
 protected:
   bool hasFPImpl(const MachineFunction &MF) const override;
 
+  /// Whether a stack object wants more alignment than the stack
+  /// guarantees, so the prologue has to align SP down itself.
+  bool needsRealignment(const MachineFunction &MF) const;
+
 public:
   explicit MoeFrameLowering(const MoeSubtarget &STI);
 

@@ -47,7 +47,26 @@ MoeFrameLowering::MoeFrameLowering(const MoeSubtarget &STI)
 // use.
 bool MoeFrameLowering::hasFPImpl(const MachineFunction &MF) const {
   const MachineFrameInfo &MFI = MF.getFrameInfo();
-  return MFI.hasVarSizedObjects() || MFI.isFrameAddressTaken();
+  return MFI.hasVarSizedObjects() || MFI.isFrameAddressTaken() ||
+         needsRealignment(MF);
+}
+
+// Does this function have a stack object that wants more alignment than the
+// stack itself guarantees?
+//
+// The ABI keeps SP 4-byte aligned and nothing in it is aligned wider than a
+// word (psabi.md, 'Data model'). A language can still ask for more -
+// `_Alignas(64)`, `#[repr(align(64))]` - and when it does, the request is not
+// advisory. LLVM's optimizer *uses* the alignment it was promised: given an
+// alloca it believes is 16-byte aligned, it will compute `base + 4` as
+// `base | 4`, which is the same thing only if the low bits really are clear.
+//
+// This target used to promise and not deliver. The resulting code stored half
+// of a `u64` at the wrong address, which is how crossbeam-epoch's per-thread
+// structure ended up with a null pointer in it and `sort` died dereferencing
+// it - see linux-port/tests/run-coreutils-test.sh.
+bool MoeFrameLowering::needsRealignment(const MachineFunction &MF) const {
+  return MF.getFrameInfo().getMaxAlign() > getStackAlign();
 }
 
 // GP7 is the frame pointer when there is one, so it has to be saved and
@@ -118,9 +137,60 @@ void MoeFrameLowering::emitPrologue(MachineFunction &MF,
   if (MBBI != MBB.end())
     DL = MBBI->getDebugLoc();
 
+  bool Realign = needsRealignment(MF);
+
+  if (Realign) {
+    // With realignment the frame pointer means something different, and it
+    // has to be taken before anything moves SP: it is the *only* record of
+    // where the stack was, because aligning SP down moves it by an amount
+    // between zero and MaxAlign-1 that nothing can recompute afterwards. The
+    // epilogue restores SP from it and adds nothing back.
+    //
+    // Locals are still addressed from SP, which is why this works without a
+    // second register: SP does not move again after the prologue. A function
+    // that both realigns and has a variable-sized object would need both, and
+    // is rejected below rather than quietly miscompiled.
+    if (MFI.hasVarSizedObjects())
+      report_fatal_error("Moe: a function cannot both realign the stack and "
+                          "have a variable-sized stack object");
+    BuildMI(MBB, MBBI, DL, TII.get(Moe::MOVE), Moe::GP7)
+        .addReg(Moe::SP)
+        .setMIFlag(MachineInstr::FrameSetup);
+  }
+
   if (NumBytes)
     adjustStackPointer(MBB, MBBI, DL, TII, MF, NumBytes,
                         MachineInstr::FrameSetup);
+
+  if (Realign) {
+    // SP &= -MaxAlign. Aligning *down* after the frame has been allocated is
+    // what keeps every object inside it: the locals span [SP, SP+NumBytes),
+    // and moving SP down can only move that window further from the saved
+    // registers above it. PEI has already rounded NumBytes and every object's
+    // offset up to MaxAlign, so each one lands aligned.
+    //
+    // There is no AND-immediate, so the mask comes out of the literal pool -
+    // the same round trip through GP4/GP5 everything else here uses.
+    uint64_t Mask = -(uint64_t)MFI.getMaxAlign().value();
+    Constant *CV = ConstantInt::get(
+        Type::getInt32Ty(MF.getFunction().getContext()), (uint32_t)Mask);
+    unsigned CPI = MF.getConstantPool()->getConstantPoolIndex(CV, Align(4));
+
+    BuildMI(MBB, MBBI, DL, TII.get(Moe::MOVE), Moe::GP4)
+        .addReg(Moe::SP)
+        .setMIFlag(MachineInstr::FrameSetup);
+    BuildMI(MBB, MBBI, DL, TII.get(Moe::LOADabs), Moe::GP5)
+        .addConstantPoolIndex(CPI)
+        .setMIFlag(MachineInstr::FrameSetup);
+    BuildMI(MBB, MBBI, DL, TII.get(Moe::AND), Moe::GP4)
+        .addReg(Moe::GP4)
+        .addReg(Moe::GP5)
+        .setMIFlag(MachineInstr::FrameSetup);
+    BuildMI(MBB, MBBI, DL, TII.get(Moe::MOVE), Moe::SP)
+        .addReg(Moe::GP4)
+        .setMIFlag(MachineInstr::FrameSetup);
+    return;
+  }
 
   // The frame pointer is SP as it stands here, once and for all: every local
   // is at a fixed offset from this point, whatever a later variable-sized
@@ -169,6 +239,13 @@ void MoeFrameLowering::emitEpilogue(MachineFunction &MF,
     BuildMI(MBB, MBBI, DL, TII.get(Moe::MOVE), Moe::SP)
         .addReg(Moe::GP7)
         .setMIFlag(MachineInstr::FrameDestroy);
+
+  // A realigned frame is already fully unwound: its frame pointer was taken
+  // before the frame was allocated *and* before SP was aligned down, so it is
+  // exactly the stack pointer the callee-saved POPs below expect. Adding
+  // NumBytes back would overshoot by however much the alignment moved SP.
+  if (needsRealignment(MF))
+    return;
 
   if (NumBytes)
     adjustStackPointer(MBB, MBBI, DL, TII, MF, -(int64_t)NumBytes,
