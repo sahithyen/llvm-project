@@ -20,6 +20,9 @@
 #include "TargetInfo/MoeTargetInfo.h"
 #include "llvm/CodeGen/AsmPrinter.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/CodeGen/MachineConstantPool.h"
+#include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/MC/MCAssembler.h"
 #include "llvm/MC/MCExpr.h"
@@ -42,6 +45,7 @@ public:
 
   StringRef getPassName() const override { return "Moe Assembly Printer"; }
 
+  bool runOnMachineFunction(MachineFunction &MF) override;
   void emitInstruction(const MachineInstr *MI) override;
   void emitMachineConstantPoolValue(MachineConstantPoolValue *MCPV) override;
 
@@ -59,6 +63,11 @@ public:
   void printOperand(const MachineInstr *MI, unsigned OpNo, raw_ostream &O);
 
   static char ID;
+
+private:
+  // The target-specific constant-pool entries this function actually reads.
+  // See runOnMachineFunction for why it has to be computed at all.
+  SmallPtrSet<const MachineConstantPoolValue *, 8> ReferencedCPVs;
 };
 } // end anonymous namespace
 
@@ -153,15 +162,77 @@ void MoeAsmPrinter::emitInstruction(const MachineInstr *MI) {
   EmitToStreamer(*OutStreamer, TmpInst);
 }
 
+// Which constant-pool entries this function still reads.
+//
+// A call's continuation label lives in a pool entry (emitCall), and a pool
+// entry is never removed once created: nothing deletes a MachineConstantPool
+// entry when the instruction that referenced it goes away, and for an
+// ordinary pooled number that costs nothing but a dead word. For one of these
+// it is fatal. If the call is deleted - because optimization proved its block
+// unreachable, say - the continuation block goes with it, and the pool is
+// left holding `.long .LBBn_m` for a label that is never emitted. The
+// assembler then refuses the whole file with "Undefined temporary symbol".
+//
+// This was invisible at -O0, where nothing deletes a block, and at -O1/-O2 on
+// everything in llvm-tests/ and the kernel, which never produced a call in a
+// block that later became unreachable. Rust's `core` produces them constantly:
+// a bounds check whose failure arm calls a panic function, in a copy of the
+// function where the check has been proved to hold.
+//
+// So the pool is emitted against what the function still references. An entry
+// nothing reads becomes a zero word - the pool's layout and every other
+// entry's index are unchanged, which is what makes this safe to do this late.
+bool MoeAsmPrinter::runOnMachineFunction(MachineFunction &MF) {
+  ReferencedCPVs.clear();
+  const std::vector<MachineConstantPoolEntry> &CPs =
+      MF.getConstantPool()->getConstants();
+  for (const MachineBasicBlock &MBB : MF)
+    for (const MachineInstr &MI : MBB)
+      for (const MachineOperand &MO : MI.operands())
+        if (MO.isCPI() && (unsigned)MO.getIndex() < CPs.size()) {
+          const MachineConstantPoolEntry &E = CPs[MO.getIndex()];
+          if (E.isMachineConstantPoolEntry())
+            ReferencedCPVs.insert(E.Val.MachineCPVal);
+        }
+  // An entry that holds the address of another entry keeps that one alive
+  // too: only the outer one is named by an instruction.
+  bool Grew = true;
+  while (Grew) {
+    Grew = false;
+    for (const MachineConstantPoolEntry &E : CPs) {
+      if (!E.isMachineConstantPoolEntry())
+        continue;
+      auto *CPV = static_cast<MoeConstantPoolValue *>(E.Val.MachineCPVal);
+      if (!ReferencedCPVs.count(CPV) || !CPV->isCPIRef())
+        continue;
+      const MachineConstantPoolEntry &Target = CPs[CPV->getCPIRef()];
+      if (Target.isMachineConstantPoolEntry() &&
+          ReferencedCPVs.insert(Target.Val.MachineCPVal).second)
+        Grew = true;
+    }
+  }
+  return AsmPrinter::runOnMachineFunction(MF);
+}
+
 void MoeAsmPrinter::emitMachineConstantPoolValue(
     MachineConstantPoolValue *MCPV) {
   auto *CPV = static_cast<MoeConstantPoolValue *>(MCPV);
+  unsigned Size = getDataLayout().getTypeAllocSize(CPV->getType());
+
+  // Dead, and possibly naming a label that no longer exists - see
+  // runOnMachineFunction.
+  if (!ReferencedCPVs.count(CPV)) {
+    OutStreamer->AddComment("unreferenced");
+    OutStreamer->emitIntValue(0, Size);
+    return;
+  }
+
   // Either a symbol, or the label of another pool entry - which only exists
   // here, at the point the AsmPrinter names it.
   const MCExpr *Expr = MCSymbolRefExpr::create(
       CPV->isCPIRef() ? GetCPISymbol(CPV->getCPIRef()) : CPV->getSymbol(),
       OutContext);
-  OutStreamer->emitValue(Expr, getDataLayout().getTypeAllocSize(CPV->getType()));
+  OutStreamer->emitValue(Expr, Size);
 }
 
 char MoeAsmPrinter::ID = 0;
