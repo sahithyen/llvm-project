@@ -212,6 +212,13 @@ bool MoeInstrInfo::analyzeBranch(MachineBasicBlock &MBB,
     if (!I->isBranch())
       return true;
 
+    // A computed goto's destination is whatever is in a register, so there is
+    // no block here to name as TBB and nothing for a caller to rewrite.
+    // "Cannot be analyzed" is the honest answer, and the one every caller
+    // knows how to handle.
+    if (I->isIndirectBranch())
+      return true;
+
     if (I->getOpcode() == Moe::JMP) {
       if (!AllowModify) {
         TBB = I->getOperand(0).getMBB();

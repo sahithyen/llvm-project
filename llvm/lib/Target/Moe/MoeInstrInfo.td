@@ -452,6 +452,30 @@ let isBranch = 1, isTerminator = 1 in {
                       [(Moebrcc bb:$dst, timm:$cond)]>;
 } // isBranch, isTerminator
 
+// An indirect branch: `goto *p`. Expanded post-RA into MOVE $dst -> IA, the
+// same redirection RET and the indirect CALL already use - so it needs no new
+// encoding, only somewhere for instruction selection to put `brind`.
+//
+// A real instruction rather than a pseudo expanded later: post-RA pseudo
+// expansion runs *before* block placement, so a BRIND that turned into a bare
+// MOVE there would leave a block ending in something placement does not read
+// as a barrier - and it would append an unconditional jump to the layout
+// successor, unreachable behind the write to IA. Encoding it here keeps the
+// terminator flags all the way to the assembler, for the same bits.
+//
+// Jump tables remain off (see MoeISelLowering.h's areJTsAllowed): a switch is
+// still a chain of compares. This exists for computed goto, which C code
+// writes on purpose - Linux's BPF interpreter is what needed it first, and it
+// is not optional there: CONFIG_NET selects BPF.
+let isBranch = 1, isIndirectBranch = 1, isTerminator = 1, isBarrier = 1,
+    Defs = [IA], mask = 0b1111 in
+def BRIND : MoveForm<(outs), (ins GPR:$from), "move $from -> ia",
+                      [(brind GPR:$from)]> {
+  // `from` is filled in from the operand of the same name, as MOVE's two are;
+  // only the destination is fixed.
+  let to = 8; // IA, per MoeRegisterInfo.td
+}
+
 // Same real encoding as JMP (opcode 0b0000, condition AL), but with a
 // calltarget (global-address) operand instead of jmptarget (MBB). Used only
 // by the CALL pseudo's custom-inserter expansion, to jump to a *different*
