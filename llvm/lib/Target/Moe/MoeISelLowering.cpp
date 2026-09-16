@@ -812,6 +812,25 @@ MoeTargetLowering::getRegForInlineAsmConstraint(const TargetRegisterInfo *TRI,
       break;
     }
   }
+  // A named register, as `register long x __asm__("gp4")` produces. GP4 and
+  // GP5 cannot serve: they are not merely reserved from allocation, they are
+  // where code generation puts its own temporaries *after* the allocator has
+  // finished and can no longer ask for a register - the call sequence's
+  // return address, MoeFrameLowering's stack-pointer adjustment, and
+  // eliminateFrameIndex's frame-address computation all write them
+  // (psabi.md, 'Registers'). A value pinned there is not kept; it is
+  // overwritten between being set and being used, with no diagnostic.
+  //
+  // That is not a theoretical hazard. musl's syscall_arch.h named GP4 and GP5
+  // for system-call arguments four and five, and the frame-address
+  // computation for another argument overwrote one of them between the two -
+  // which made every stat() in the system fail with EINVAL, because the
+  // kernel received SP where statx's mask belonged. Refusing the constraint
+  // is what turns that into a compile error; musl-port/src/internal/moe/
+  // syscall.S is what it was fixed with.
+  if (Constraint == "{gp4}" || Constraint == "{gp5}")
+    return std::make_pair(0U, nullptr);
+
   return TargetLowering::getRegForInlineAsmConstraint(TRI, Constraint, VT);
 }
 
