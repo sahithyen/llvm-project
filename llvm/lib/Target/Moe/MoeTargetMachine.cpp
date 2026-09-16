@@ -15,6 +15,7 @@
 #include "MoeMachineFunctionInfo.h"
 #include "TargetInfo/MoeTargetInfo.h"
 #include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
+#include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/Compiler.h"
@@ -59,6 +60,7 @@ public:
     return getTM<MoeTargetMachine>();
   }
 
+  void addIRPasses() override;
   bool addInstSelector() override;
 };
 } // namespace
@@ -72,6 +74,19 @@ MachineFunctionInfo *MoeTargetMachine::createMachineFunctionInfo(
     const TargetSubtargetInfo *STI) const {
   return MoeMachineFunctionInfo::create<MoeMachineFunctionInfo>(Allocator, F,
                                                                  STI);
+}
+
+// AtomicExpandPass is not added by TargetPassConfig - every target that wants
+// it adds it here - and Moe needs it more than most: the ISA has no atomic
+// instruction at any width, so MoeISelLowering's
+// setMaxAtomicSizeInBitsSupported(0) leaves this pass to turn every atomic in
+// the IR into an __atomic_* libcall. Without the pass the atomics reach
+// instruction selection intact and the compile dies on "Cannot select" -
+// which is at least loud, but only reachable by code that uses atomics, so
+// nothing here noticed until Rust did.
+void MoePassConfig::addIRPasses() {
+  addPass(createAtomicExpandLegacyPass());
+  TargetPassConfig::addIRPasses();
 }
 
 bool MoePassConfig::addInstSelector() {

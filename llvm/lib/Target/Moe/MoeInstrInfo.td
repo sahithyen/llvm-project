@@ -180,6 +180,25 @@ def CALLSEQreg : MoePseudo<(outs), (ins GPR:$callee, moeaddr:$ret),
 let isReturn = 1, isTerminator = 1, isBarrier = 1, Uses = [SP], Defs = [SP] in
 def RET : MoePseudo<(outs), (ins), "#RET", [(Moeret)]>;
 
+// A memory fence, matched to LLVM's own MEMBARRIER pseudo (Target.td), which
+// the AsmPrinter turns into a comment and no instruction.
+//
+// One core, in order, no store buffer and no cache: there is nothing for the
+// *hardware* to be told. But the fence still has to survive as far as the
+// AsmPrinter, because it is also a barrier to the *compiler* - MEMBARRIER has
+// hasSideEffects, which is what stops a memory access being scheduled across
+// it. Dropping ATOMIC_FENCE at ISel instead would allow exactly that, and the
+// resulting bug would only show up under an interrupt landing in the
+// reordered window.
+//
+// Leaving ATOMIC_FENCE at its Expand default is not an option either: that
+// emits a call to __sync_synchronize, which nothing here provides.
+//
+// Both operands are matched, unlike AArch64's and ARM's equivalents, which
+// match only syncscope 0: a single-threaded fence and a system one are the
+// same nothing here.
+def : Pat<(atomic_fence (timm), (timm)), (MEMBARRIER)>;
+
 // Software multiply (see the Milestone 3 plan's "Software multiply" section):
 // SHIFT moves exactly one bit per instruction and its carry-out is the bit
 // shifted out, so a shift-and-add loop can test each multiplier bit directly

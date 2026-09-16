@@ -39,6 +39,24 @@ MoeTargetLowering::MoeTargetLowering(const TargetMachine &TM,
   setStackPointerRegisterToSaveRestore(Moe::SP);
   setBooleanContents(ZeroOrOneBooleanContent);
 
+  // Atomics. The ISA has no atomic read-modify-write instruction of any
+  // width, and it never will: on a backplane of discrete TTL there is no
+  // second processor to be atomic against, and the one hazard that remains -
+  // an interrupt landing mid-sequence - cannot be closed by userspace, which
+  // cannot mask interrupts.
+  //
+  // So every atomic becomes an __atomic_* libcall. Zero here (rather than 8,
+  // 16 or 32) is what makes AtomicExpandPass expand *all* of them, including
+  // the byte-sized ones: there is no width this target can do inline.
+  //
+  // The libcalls are implemented in runtime/atomic.ll over the
+  // kernel's kuser-page compare-and-swap, which is a restartable sequence
+  // rather than an instruction - see psabi.md, 'The kuser page'. Nothing
+  // implements the 8-byte forms, so a consumer that asks for one gets a link
+  // error rather than something quiet; Rust is stopped from asking by its
+  // target spec's max_atomic_width.
+  setMaxAtomicSizeInBitsSupported(0);
+
   // JUMP/LOAD/STORE's trailing operand word must land on a word-aligned
   // address (see 'Addressing mode' in the Encoding chapter); the MC-layer
   // encoder (Milestone 2) decides padding by tracking each function's
