@@ -1,11 +1,19 @@
-; RUN: llc -mtriple=moe -O0 < %s | FileCheck %s
-; RUN: env MOE_NO_SHORT_BRANCH=1 llc -mtriple=moe -O0 < %s | FileCheck %s --check-prefix=LONG
+; RUN: llc -mtriple=moe -O0 -verify-machineinstrs < %s | FileCheck %s
+; RUN: env MOE_NO_SHORT_BRANCH=1 llc -mtriple=moe -O0 -verify-machineinstrs < %s \
+; RUN:   | FileCheck %s --check-prefix=LONG
 
 ; The ISA evaluation's N1: a branch to one of this function's own blocks is
 ; four bytes rather than eight when its target is within the +-2 KiB a 12-bit
 ; displacement reaches. MoeShortBranches picks the form, because the
 ; displacement is a symbol difference nothing knows until layout. See that
 ; file's header for why it cannot be done in MoeMCInstLower or by relaxation.
+;
+; -verify-machineinstrs is not decoration: the pass rewrites branches in the MI
+; stream, so every later pass has to be able to read them, and the machine
+; verifier is what noticed that MoeInstrInfo::analyzeBranch could not. It
+; asserted on the new opcodes, which showed up as rustc dying while building
+; `alloc` - a compiler with assertions on, where llvm-tests' own release build
+; is not.
 
 define i32 @near(i32 %n) {
 ; CHECK-LABEL: near:

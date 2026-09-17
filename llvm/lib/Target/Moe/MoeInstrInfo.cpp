@@ -219,7 +219,12 @@ bool MoeInstrInfo::analyzeBranch(MachineBasicBlock &MBB,
     if (I->isIndirectBranch())
       return true;
 
-    if (I->getOpcode() == Moe::JMP) {
+    // The short PC-relative twins are the same branches in a smaller encoding -
+    // MoeShortBranches rewrites them in place, pre-emit, so anything that looks
+    // at the MI stream after that point sees them. Analysing them exactly as
+    // their long forms is what keeps a later pass (the machine verifier, which
+    // is what found this) from meeting a branch it cannot read.
+    if (I->getOpcode() == Moe::JMP || I->getOpcode() == Moe::JMPpc_S) {
       if (!AllowModify) {
         TBB = I->getOperand(0).getMBB();
         continue;
@@ -240,7 +245,8 @@ bool MoeInstrInfo::analyzeBranch(MachineBasicBlock &MBB,
       continue;
     }
 
-    assert(I->getOpcode() == Moe::JCC && "Invalid conditional branch");
+    assert((I->getOpcode() == Moe::JCC || I->getOpcode() == Moe::JCCpc_S) &&
+           "Invalid conditional branch");
     int BranchCode = I->getOperand(1).getImm();
 
     if (Cond.empty()) {
@@ -277,7 +283,8 @@ unsigned MoeInstrInfo::removeBranch(MachineBasicBlock &MBB,
     --I;
     if (I->isDebugInstr())
       continue;
-    if (I->getOpcode() != Moe::JMP && I->getOpcode() != Moe::JCC)
+    if (I->getOpcode() != Moe::JMP && I->getOpcode() != Moe::JCC &&
+        I->getOpcode() != Moe::JMPpc_S && I->getOpcode() != Moe::JCCpc_S)
       break;
     I->eraseFromParent();
     I = MBB.end();
