@@ -1512,8 +1512,26 @@ MachineBasicBlock *MoeTargetLowering::emitVarShift(MachineInstr &MI,
     TestBB->addSuccessor(ShiftBB);
     ShiftBB->addSuccessor(MergeBB);
 
+    // Block K shifts by 2^K when bit K of the amount is set. That is 2^K
+    // single-bit shifts, or half as many two-bit ones since candidate N3 gave
+    // SHIFT an Amount field - 16 instructions across the five blocks instead of
+    // 31, and about half as many executed for any given amount. 2^K is even for
+    // every K but 0, so only the first block keeps a single-bit shift.
+    static const bool NoAmount = std::getenv("MOE_NO_SHIFT_AMOUNT") != nullptr;
+    unsigned Count = 1u << K;
     Register Shifted = Value;
-    for (unsigned I = 0; I < (1u << K); ++I) {
+    if (!NoAmount) {
+      unsigned WideOpc = ShiftOpc == Moe::SHL   ? Moe::SHL2
+                         : ShiftOpc == Moe::SRL ? Moe::SRL2
+                                                : Moe::SRA2;
+      for (unsigned I = 0; I < Count / 2; ++I) {
+        Register Next = MRI.createVirtualRegister(RC);
+        BuildMI(ShiftBB, DL, TII->get(WideOpc), Next).addReg(Shifted);
+        Shifted = Next;
+      }
+      Count %= 2;
+    }
+    for (unsigned I = 0; I < Count; ++I) {
       Register Next = MRI.createVirtualRegister(RC);
       BuildMI(ShiftBB, DL, TII->get(ShiftOpc), Next).addReg(Shifted);
       Shifted = Next;
