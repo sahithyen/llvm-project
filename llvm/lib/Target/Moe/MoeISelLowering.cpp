@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "MoeISelLowering.h"
+#include <cstdlib>
 #include "MoeConstantPoolValue.h"
 #include "MoeMachineFunctionInfo.h"
 #include "MoeSubtarget.h"
@@ -524,18 +525,22 @@ SDValue MoeTargetLowering::LowerShifts(SDValue Op, SelectionDAG &DAG) const {
   SDLoc dl(N);
 
   unsigned SingleBitOpc;
+  unsigned TwoBitOpc;
   unsigned RealOpc; // Moe::SHL/SRL/SRA - the loop body emitVarShift builds.
   switch (Op.getOpcode()) {
   case ISD::SHL:
     SingleBitOpc = MoeISD::SHL1;
+    TwoBitOpc = MoeISD::SHL2;
     RealOpc = Moe::SHL;
     break;
   case ISD::SRL:
     SingleBitOpc = MoeISD::SRL1;
+    TwoBitOpc = MoeISD::SRL2;
     RealOpc = Moe::SRL;
     break;
   case ISD::SRA:
     SingleBitOpc = MoeISD::SRA1;
+    TwoBitOpc = MoeISD::SRA2;
     RealOpc = Moe::SRA;
     break;
   default:
@@ -555,10 +560,32 @@ SDValue MoeTargetLowering::LowerShifts(SDValue Op, SelectionDAG &DAG) const {
                    0);
   }
 
+  // A constant shift is a chain of single-bit shifts, because that is what the
+  // instruction does - and since candidate N3 gave SHIFT an Amount bit, half as
+  // long a chain: ceil(n/2) two-bit shifts, plus one single-bit shift when n is
+  // odd. The odd one goes first so that the common `shift by 1` stays exactly
+  // the instruction it was.
+  //
+  // MOE_NO_SHIFT_AMOUNT emits the old chain instead, so that the same source
+  // can be built both ways and measured - the pairing MOE_NO_SHORT_FORM and
+  // MOE_NO_SHORT_BRANCH already exist for, and for the same reason: comparing
+  // against a number taken before some other commit compares two things that
+  // differ in more than one way.
+  static const bool NoAmount = std::getenv("MOE_NO_SHIFT_AMOUNT") != nullptr;
+
   uint64_t ShiftAmount = Amt->getZExtValue();
   SDValue Result = N->getOperand(0);
-  while (ShiftAmount--)
+  if (NoAmount) {
+    while (ShiftAmount--)
+      Result = DAG.getNode(SingleBitOpc, dl, VT, Result);
+    return Result;
+  }
+  if (ShiftAmount % 2) {
     Result = DAG.getNode(SingleBitOpc, dl, VT, Result);
+    --ShiftAmount;
+  }
+  for (uint64_t Pair = ShiftAmount / 2; Pair--;)
+    Result = DAG.getNode(TwoBitOpc, dl, VT, Result);
   return Result;
 }
 

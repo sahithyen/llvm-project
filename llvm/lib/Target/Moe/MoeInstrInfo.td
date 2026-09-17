@@ -46,6 +46,9 @@ def Moewrapper : SDNode<"MoeISD::Wrapper", SDT_MoeWrapper>;
 // legalizer re-visiting and re-lowering each intermediate step - see the
 // Milestone 1 plan's SHIFT notes.
 def Moeshl1 : SDNode<"MoeISD::SHL1", SDTIntUnaryOp>;
+def Moeshl2 : SDNode<"MoeISD::SHL2", SDTIntUnaryOp>;
+def Moesrl2 : SDNode<"MoeISD::SRL2", SDTIntUnaryOp>;
+def Moesra2 : SDNode<"MoeISD::SRA2", SDTIntUnaryOp>;
 def Moesrl1 : SDNode<"MoeISD::SRL1", SDTIntUnaryOp>;
 def Moesra1 : SDNode<"MoeISD::SRA1", SDTIntUnaryOp>;
 
@@ -432,6 +435,23 @@ def SRL : ShiftForm<(outs GPR:$o), (ins GPR:$a), "shift.right $a -> $o",
 let right = 1, arithmetic = 1 in
 def SRA : ShiftForm<(outs GPR:$o), (ins GPR:$a), "shift.right.arith $a -> $o",
                      [(set GPR:$o, (Moesra1 GPR:$a))]>;
+
+// The by-two forms - candidate N3. Same instruction, same three T-states, with
+// Amount set: the shifter's mux array takes the neighbour two places away
+// instead of one, for eight packages (see hardware/moe_hw/blocks/shifter.py).
+// LowerShifts emits ceil(n/2) of these for a constant shift by n, which is
+// what removes half of every SHIFT this machine executes.
+let right = 0, amount = 1 in
+def SHL2 : ShiftForm<(outs GPR:$o), (ins GPR:$a), "shift.left.2 $a -> $o",
+                      [(set GPR:$o, (Moeshl2 GPR:$a))]>;
+
+let right = 1, arithmetic = 0, amount = 1 in
+def SRL2 : ShiftForm<(outs GPR:$o), (ins GPR:$a), "shift.right.2 $a -> $o",
+                      [(set GPR:$o, (Moesrl2 GPR:$a))]>;
+
+let right = 1, arithmetic = 1, amount = 1 in
+def SRA2 : ShiftForm<(outs GPR:$o), (ins GPR:$a), "shift.right.arith.2 $a -> $o",
+                      [(set GPR:$o, (Moesra2 GPR:$a))]>;
 
 let right = 0, carryin = 1 in
 def SHLc : ShiftForm<(outs GPR:$o), (ins GPR:$a), "shift.left.c $a -> $o", []>;

@@ -193,7 +193,11 @@ class AluTestForm<bits<4> opcode, dag outs, dag ins, string asmstr,
 // SHIFT (0b1111)
 class ShiftForm<dag outs, dag ins, string asmstr, list<dag> pattern>
     : MoeInst<outs, ins, asmstr, pattern> {
-  bit test = 0;
+  // Bit 11 is SHIFT's Amount - 0 shifts by one bit, 1 by two - where AND, OR
+  // and XOR have Test mode. See 'ALU Test mode' in the Encoding chapter, and
+  // isa-evaluation.md's N3: a shift by one bit at a time is what SHIFT spends
+  // most of its executions on, and one bit of amount removes half of them.
+  bit amount = 0;
   bits<2> size = 0b00;
   bit carryin = 0;
   bit right;
@@ -201,7 +205,7 @@ class ShiftForm<dag outs, dag ins, string asmstr, list<dag> pattern>
   bits<3> a;
   bits<3> o;
   let Inst{15-12} = 0b1111;
-  let Inst{11}    = test;
+  let Inst{11}    = amount;
   let Inst{10-9}  = size;
   let Inst{8}     = carryin;
   let Inst{7}     = right;

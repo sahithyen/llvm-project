@@ -30,6 +30,11 @@ enum NodeType {
   SHL1,
   SRL1,
   SRA1,
+  // The by-two forms, candidate N3: SHIFT's Amount bit. A constant shift by n
+  // is ceil(n/2) of these plus at most one single-bit shift.
+  SHL2,
+  SRL2,
+  SRA2,
 };
 }
 
