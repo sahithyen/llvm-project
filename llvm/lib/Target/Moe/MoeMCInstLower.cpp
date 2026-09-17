@@ -13,6 +13,7 @@
 
 #include "MoeMCInstLower.h"
 #include "MCTargetDesc/MoeMCTargetDesc.h"
+#include <cstdlib>
 #include "llvm/CodeGen/AsmPrinter.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineInstr.h"
@@ -155,8 +156,18 @@ void MoeMCInstLower::Lower(const MachineInstr *MI, MCInst &OutMI) const {
   // A symbolic offset is left long. It cannot be range-checked here, and there
   // is no relocation that writes a shifted 12-bit field, so the long form is
   // the only one that can be emitted honestly.
+  //
+  // MOE_NO_SHORT_FORM turns the rewrite off. It exists because the only honest
+  // way to price an encoding is to build the same source both ways and run
+  // both, and the alternative - comparing against a measurement taken before
+  // some other commit - compares two things that differ in more than one way.
+  // It found something no static model would have: the short form takes 18% off
+  // the kernel's text and 2.5% off its instruction T-states, and *costs* 3.4% of
+  // a boot on the machine as built, because the denser layout aliases worse in a
+  // 32-entry direct-mapped TLB. See isa-evaluation.md's S9 finding.
   int ShortOpc = shortRegisterIndirectOpcode(OutMI.getOpcode());
-  if (ShortOpc >= 0) {
+  static const bool Disabled = getenv("MOE_NO_SHORT_FORM") != nullptr;
+  if (ShortOpc >= 0 && !Disabled) {
     int Base = memBaseOperand(OutMI.getOpcode());
     if (Base >= 0 && Base + 1 < (int)OutMI.getNumOperands()) {
       const MCOperand &Offset = OutMI.getOperand(Base + 1);
