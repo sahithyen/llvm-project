@@ -5,3 +5,8 @@
 
 ELF_RELOC(R_MOE_NONE, 0)
 ELF_RELOC(R_MOE_32,   1)
+// Emitted by the linker, never by the assembler: "add the load bias to the
+// 32-bit word here". It is what makes a position-independent executable
+// possible on this target - see lld/ELF/Arch/Moe.cpp and musl-port's
+// self-relocating entry.
+ELF_RELOC(R_MOE_RELATIVE, 2)
