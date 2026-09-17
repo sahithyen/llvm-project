@@ -13,6 +13,7 @@
 #include "llvm/MC/MCFixup.h"
 #include "llvm/MC/MCObjectWriter.h"
 #include "llvm/MC/MCValue.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/Support/ErrorHandling.h"
 
 using namespace llvm;
@@ -46,6 +47,18 @@ protected:
       return IsPCRel ? ELF::R_MOE_PCREL32 : ELF::R_MOE_32;
     case Moe::fixup_moe_pcrel28:
       return ELF::R_MOE_PCREL28;
+    case Moe::fixup_moe_pcrel12:
+      // A short form's twelve bits reach +-2 KiB, which is a distance inside
+      // one function, so MC resolves every one of these at layout and none
+      // should ever arrive here. One that did would be a reference across
+      // sections that no relocation can express - there is no R_MOE for a
+      // shifted 12-bit field, and inventing one would mean a linker that
+      // silently truncates. Reported rather than emitted.
+      reportError(Fixup.getLoc(),
+                  Twine("a short PC-relative branch cannot reach outside its "
+                        "own section, and there is no relocation for one that "
+                        "tries"));
+      return ELF::R_MOE_NONE;
     default:
       llvm_unreachable("Invalid fixup kind");
     }

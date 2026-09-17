@@ -32,9 +32,13 @@ entry:
   %c = icmp sgt i32 %n, 0
   br i1 %c, label %yes, label %no
 
-; A conditional branch to one of this function's own blocks.
-; STATIC:         jump.LT .LBB1_
-; PIC:            jump.LT.pc .LBB1_
+; A conditional branch to one of this function's own blocks, which is the one
+; place the two models now produce the *same* instruction: MoeShortBranches
+; gives any branch that reaches +-2 KiB the short PC-relative form regardless of
+; relocation model, because it is smaller and faster and needs no relocation
+; either way. See MoeShortBranches.cpp - the ISA evaluation's N1.
+; STATIC:         jump.LT.pc.s .LBB1_
+; PIC:            jump.LT.pc.s .LBB1_
 
 yes:
 ; The return address a call pushes, then the call's outbound jump.

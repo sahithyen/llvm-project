@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "MoeMCInstLower.h"
+#include "MoeShortForms.h"
 #include "MCTargetDesc/MoeMCTargetDesc.h"
 #include <cstdlib>
 #include "llvm/CodeGen/AsmPrinter.h"
@@ -53,53 +54,10 @@ MCOperand MoeMCInstLower::LowerSymbolOperand(const MachineOperand &MO,
 
 namespace {
 
-// The short twin of a register-indirect LOAD/STORE, or -1 if there isn't one.
-//
-// The two differ only in Addressing mode - bit 8 of the opcode halfword - and
-// in whether the operand is a halfword after the opcode or a word at the next
-// aligned address. Every operand list is identical, so the rewrite below is a
-// change of opcode and nothing else.
-int shortRegisterIndirectOpcode(unsigned Opc) {
-  switch (Opc) {
-  case Moe::LOADrr:     return Moe::LOADrr_S;
-  case Moe::STORErr:    return Moe::STORErr_S;
-  case Moe::LOADrr_A:   return Moe::LOADrr_AS;
-  case Moe::STORErr_A:  return Moe::STORErr_AS;
-  case Moe::LOADrr_B:   return Moe::LOADrr_BS;
-  case Moe::LOADrr_H:   return Moe::LOADrr_HS;
-  case Moe::STORErr_B:  return Moe::STORErr_BS;
-  case Moe::STORErr_H:  return Moe::STORErr_HS;
-  default:              return -1;
-  }
-}
-
-// Which operand of a lowered register-indirect LOAD/STORE is the base
-// register; its offset is the one after it. This mirrors
-// MoeELFStreamer's own getTrailingOperand and for the same reason: LOADrr_B/H
-// carry a tied $oldval ahead of the address, so their base is operand 2 while
-// everything else's is operand 1.
-int memBaseOperand(unsigned Opc) {
-  switch (Opc) {
-  case Moe::LOADrr_B:
-  case Moe::LOADrr_H:
-    return 2;
-  case Moe::LOADrr:
-  case Moe::STORErr:
-  case Moe::LOADrr_A:
-  case Moe::STORErr_A:
-  case Moe::STORErr_B:
-  case Moe::STORErr_H:
-    return 1;
-  default:
-    return -1;
-  }
-}
-
-// Twelve signed bits, which is what the halfword operand has left once four
-// go to the base register - see 'Addressing mode' in the Encoding chapter.
-bool offsetFitsShortForm(int64_t Offset) {
-  return Offset >= -2048 && Offset <= 2047;
-}
+// The rules for which instructions get a short form live in MoeShortForms.h,
+// shared with MoeShortBranches - which has to predict the size of everything
+// here in order to work out which branches reach, and would mispredict rather
+// than fail to build if the two ever disagreed.
 
 // The PC-relative twin of an instruction whose trailing operand is an absolute
 // address, or -1 if there isn't one.
@@ -202,13 +160,12 @@ void MoeMCInstLower::Lower(const MachineInstr *MI, MCInst &OutMI) const {
       OutMI.setOpcode(PcRelOpc);
   }
 
-  int ShortOpc = shortRegisterIndirectOpcode(OutMI.getOpcode());
-  static const bool Disabled = getenv("MOE_NO_SHORT_FORM") != nullptr;
-  if (ShortOpc >= 0 && !Disabled) {
-    int Base = memBaseOperand(OutMI.getOpcode());
+  int ShortOpc = Moe::shortRegisterIndirectOpcode(OutMI.getOpcode());
+  if (ShortOpc >= 0 && !Moe::shortFormsDisabled()) {
+    int Base = Moe::memBaseOperand(OutMI.getOpcode());
     if (Base >= 0 && Base + 1 < (int)OutMI.getNumOperands()) {
       const MCOperand &Offset = OutMI.getOperand(Base + 1);
-      if (Offset.isImm() && offsetFitsShortForm(Offset.getImm()))
+      if (Offset.isImm() && Moe::fitsShortForm(Offset.getImm()))
         OutMI.setOpcode(ShortOpc);
     }
   }

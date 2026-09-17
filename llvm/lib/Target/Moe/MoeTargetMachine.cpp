@@ -60,6 +60,8 @@ public:
     return getTM<MoeTargetMachine>();
   }
 
+  void addPreEmitPass() override;
+
   void addIRPasses() override;
   bool addInstSelector() override;
 };
@@ -92,4 +94,13 @@ void MoePassConfig::addIRPasses() {
 bool MoePassConfig::addInstSelector() {
   addPass(createMoeISelDag(getMoeTargetMachine(), getOptLevel()));
   return false;
+}
+
+// Branch shortening runs last, after every pass that can still move an
+// instruction: it decides which branches get the four-byte PC-relative form by
+// predicting the final layout, and a later pass inserting or deleting anything
+// would invalidate that prediction. See MoeShortBranches.cpp - and note that
+// its mistakes are caught by MoeAsmBackend rather than executed.
+void MoePassConfig::addPreEmitPass() {
+  addPass(createMoeShortBranchesPass());
 }

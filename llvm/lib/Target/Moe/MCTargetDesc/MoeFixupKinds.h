@@ -44,6 +44,18 @@ enum Fixups {
   /// emulator/src/cpu.rs).
   fixup_moe_pcrel28 = FirstTargetFixupKind,
 
+  /// The same field in a *short* form's halfword operand: a 12-bit signed
+  /// PC-relative displacement in bits 15-4, over the same four bits of base
+  /// register select. The addend is -2 rather than -4, because a short form's
+  /// operand is two bytes and IA stands at its end.
+  ///
+  /// There is deliberately no relocation behind this one. A 12-bit field
+  /// reaches +-2 KiB, which is a distance only within one function, so MC
+  /// resolves every one of these during layout; anything that survived to the
+  /// object file would be a reference the linker has no way to write. The ELF
+  /// writer says so rather than inventing a relocation number.
+  fixup_moe_pcrel12,
+
   fixup_moe_NumTargetFixupKinds
 };
 

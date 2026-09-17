@@ -552,6 +552,41 @@ def JMPabs_pc : JumpForm<0b10, (outs), (ins calltarget:$dst),
 }
 
 //===----------------------------------------------------------------------===//
+// The short PC-relative branches - the ISA evaluation's N1, and the cheapest
+// candidate it has: no new opcode, no new addressing mode, no packages. A
+// branch is Addressing mode 3 with IA as the base register, so the whole
+// instruction is four bytes, and at a word-aligned address it is one memory
+// access and three T-states instead of two and four.
+//
+// The reach is what makes these a decision rather than a rewrite: twelve
+// signed bits, +-2 KiB from the end of the operand halfword. Whether a given
+// branch reaches is a property of the final layout, which neither instruction
+// selection nor MoeMCInstLower can know - the offset is a symbol difference,
+// not a constant, which is exactly where this differs from the short
+// LOAD/STORE forms above. MoeShortBranches (a pre-emit MachineFunction pass)
+// computes block offsets to a fixed point and rewrites the branches that fit;
+// MoeAsmBackend's range check on fixup_moe_pcrel12 is the net that turns a
+// mistake in that model into a diagnostic rather than a branch to the wrong
+// place.
+//
+// Size is 4 rather than the usual 2 because these carry their operand inside
+// themselves: the halfword right after the opcode, no padding, no alignment of
+// its own. That is what MoeShortBranches measures with.
+//===----------------------------------------------------------------------===//
+
+let isBranch = 1, isTerminator = 1, Size = 4 in {
+  let isBarrier = 1 in
+  def JMPpc_S : JumpForm<0b11, (outs), (ins jmptarget:$dst), "jump.al.pc.s $dst",
+                          []> {
+    let cond = 0; // AL
+  }
+
+  let Uses = [F] in
+  def JCCpc_S : JumpForm<0b11, (outs), (ins jmptarget:$dst, cc:$cond),
+                          "jump.${cond}.pc.s $dst", []>;
+} // isBranch, isTerminator, Size
+
+//===----------------------------------------------------------------------===//
 // SYSCALL (0b0001) / IRET (0b0010) / INVALIDATE (0b0011) - the three
 // operand-less control-transfer instructions, using MoeInstrFormats.td's
 // NoOperandForm. None of them is ever produced by instruction selection:

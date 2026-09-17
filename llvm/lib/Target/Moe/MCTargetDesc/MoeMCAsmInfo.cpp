@@ -21,6 +21,13 @@ MoeMCAsmInfo::MoeMCAsmInfo(const Triple &TT) {
   CodePointerSize = 4;
   CalleeSaveStackSlotSize = 4;
 
+  // A long-form JUMP/LOAD/STORE at a word-aligned address is the longest thing
+  // this target emits: two bytes of opcode, two of padding and a four-byte
+  // trailing operand. The default is 4, which would have had AsmPrinter -
+  // and MoeShortBranches, which follows it - believe an inline-asm statement
+  // could be half the size it can really be.
+  MaxInstLength = 8;
+
   CommentString = ";";
   // With ';' taken by comments, statements on one line are separated by a
   // backtick instead - ARC's convention, for the same reason. The default

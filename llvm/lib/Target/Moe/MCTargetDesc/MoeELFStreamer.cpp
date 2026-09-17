@@ -75,7 +75,9 @@ struct TrailingOperand {
   bool Short = false;
   // A PC-relative form: one symbolic operand, like the absolute forms, but the
   // word holds a displacement from itself in bits 31-4 and IA's base register
-  // select in bits 3-0 rather than a whole address. See MoeFixupKinds.h.
+  // select in bits 3-0 rather than a whole address. See MoeFixupKinds.h. With
+  // Short, the same thing in a halfword: twelve bits of displacement over the
+  // same four of base register select.
   bool PcRel = false;
 
   bool isAbsolute() const { return SymOperand >= 0; }
@@ -153,6 +155,17 @@ TrailingOperand getTrailingOperand(const MCInst &MI) {
     T.MemBaseOperand = 2;
     T.Short = true;
     break;
+  // The short PC-relative branches (N1). Both halves of the short form at
+  // once: the operand is a halfword right after the opcode, *and* it holds a
+  // displacement rather than a base register and a constant - so this is the
+  // one shape with no base-register operand to read, like the long PC-relative
+  // forms, and no alignment of its own, like the short register-indirect ones.
+  case Moe::JMPpc_S:
+  case Moe::JCCpc_S:
+    T.SymOperand = 0;
+    T.PcRel = true;
+    T.Short = true;
+    break;
   default:
     break;
   }
@@ -169,6 +182,25 @@ void MoeELFStreamer::emitInstruction(const MCInst &Inst,
   TrailingOperand T = getTrailingOperand(Inst);
   if (!T.exists())
     return;
+
+  if (T.Short && T.PcRel) {
+    // A short branch's own halfword. Same shape as the long PC-relative case
+    // below - a fixup over bytes that already hold IA's register select - with
+    // two differences: the field is twelve bits instead of twenty-eight, and
+    // the addend is -2 rather than -4, because IA stands at the end of a
+    // two-byte operand rather than a four-byte one.
+    const MCOperand &MO = Inst.getOperand(T.SymOperand);
+    assert(MO.isExpr() && "A short PC-relative branch names a block");
+    MCContext &Ctx = getContext();
+    const MCExpr *Expr = MCBinaryExpr::createSub(
+        MO.getExpr(), MCConstantExpr::create(2, Ctx), Ctx);
+    ensureHeadroom(2);
+    getCurrentFragment()->addFixup(MCFixup::create(
+        getCurFragSize(), Expr, Moe::fixup_moe_pcrel12, /*PCRel=*/true));
+    const char Half[2] = {static_cast<char>(IARegSelect), 0};
+    appendContents(Half);
+    return;
+  }
 
   if (T.Short) {
     // No alignment directive and no padding: the operand is the halfword that

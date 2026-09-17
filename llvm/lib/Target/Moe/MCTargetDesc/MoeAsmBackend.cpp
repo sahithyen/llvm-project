@@ -42,6 +42,9 @@ public:
     if (Kind == Moe::fixup_moe_pcrel28)
       return {"fixup_moe_pcrel28", /*TargetOffset=*/4, /*TargetSize=*/28,
               /*Flags=*/0};
+    if (Kind == Moe::fixup_moe_pcrel12)
+      return {"fixup_moe_pcrel12", /*TargetOffset=*/4, /*TargetSize=*/12,
+              /*Flags=*/0};
     return MCAsmBackend::getFixupKindInfo(Kind);
   }
 
@@ -75,6 +78,32 @@ void MoeAsmBackend::applyFixup(const MCFragment &F, const MCFixup &Fixup,
     }
     uint32_t Field = static_cast<uint32_t>(Displacement) << 4;
     for (unsigned i = 0; i != 4; ++i)
+      Data[i] |= uint8_t((Field >> (i * 8)) & 0xff);
+    return;
+  }
+
+  if (Fixup.getKind() == Moe::fixup_moe_pcrel12) {
+    // The short form's half of the same field: twelve signed bits in the
+    // halfword's top twelve, over the base register select underneath.
+    //
+    // **This range check is the net under MoeShortBranches**, the pass that
+    // decides which branches get this form. That pass models instruction
+    // sizes to predict a displacement it cannot yet see; this is the place
+    // where the displacement is finally known. An error here means the model
+    // was wrong, and it is a diagnostic rather than a branch to the wrong
+    // place - which is what makes modelling it acceptable at all.
+    int64_t Displacement = static_cast<int64_t>(Value);
+    if (!isInt<12>(Displacement)) {
+      Asm->getContext().reportError(
+          Fixup.getLoc(),
+          "PC-relative displacement of " + Twine(Displacement) +
+              " does not fit in the 12 signed bits of a short form's operand "
+              "halfword (MoeShortBranches chose the short form for a branch "
+              "that turned out not to reach)");
+      return;
+    }
+    uint16_t Field = static_cast<uint16_t>(Displacement) << 4;
+    for (unsigned i = 0; i != 2; ++i)
       Data[i] |= uint8_t((Field >> (i * 8)) & 0xff);
     return;
   }

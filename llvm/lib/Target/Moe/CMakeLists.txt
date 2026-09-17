@@ -21,6 +21,7 @@ add_llvm_target(MoeCodeGen
   MoeFrameLowering.cpp
   MoeMachineFunctionInfo.cpp
   MoeRegisterInfo.cpp
+  MoeShortBranches.cpp
   MoeSubtarget.cpp
   MoeTargetMachine.cpp
   MoeAsmPrinter.cpp

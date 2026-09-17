@@ -24,8 +24,13 @@ class PassRegistry;
 
 FunctionPass *createMoeISelDag(MoeTargetMachine &TM, CodeGenOptLevel OptLevel);
 
+/// Picks the four-byte PC-relative form for every branch that reaches - the
+/// ISA evaluation's N1. Pre-emit, because the decision needs the layout.
+FunctionPass *createMoeShortBranchesPass();
+
 void initializeMoeAsmPrinterPass(PassRegistry &);
 void initializeMoeDAGToDAGISelLegacyPass(PassRegistry &);
+void initializeMoeShortBranchesPass(PassRegistry &);
 
 } // namespace llvm
 
