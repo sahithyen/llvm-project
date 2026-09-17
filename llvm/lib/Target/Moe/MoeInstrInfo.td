@@ -678,6 +678,63 @@ def FIADDR : MoePseudo<(outs GPR:$dst), (ins moemem:$addr),
 // genuine partial-merge-write semantic directly, the same way INCREMENT's
 // existing "$o = $oin" tie already does for its own read-modify-write.
 //===----------------------------------------------------------------------===//
+// Short register-indirect (Addressing mode 0b11) - the same eight
+// instructions with their operand in the halfword right after the opcode
+// instead of a word at the next aligned address, so the whole instruction is
+// one aligned 32-bit word and costs one T-state less at a word-aligned
+// address. See 'Addressing mode' in the Encoding chapter, and
+// isa-evaluation.md's S9 finding for why this is where the win is.
+//
+// **None of these has a pattern.** Instruction selection never chooses
+// between the long and short forms: they differ only in whether a
+// compile-time-known offset fits twelve signed bits, which is not a property
+// SelectionDAG should be reasoning about and which would need every pattern
+// duplicated with a predicate. MoeMCInstLower rewrites a long form into its
+// short twin when the offset fits, at the point where the operand is already
+// a constant - see shortRegisterIndirectOpcode there. They are defs rather
+// than encoder tricks so that the assembler can write one, the disassembler
+// and InstPrinter agree with the encoder, and the MC layer computes the
+// instruction's real size.
+//===----------------------------------------------------------------------===//
+
+def LOADrr_S : LoadStoreForm<0b0101, 0b11, (outs GPR:$reg), (ins moemem:$addr),
+                              "load.w.s $addr -> $reg", []>;
+
+def STORErr_S : LoadStoreForm<0b0110, 0b11, (outs), (ins GPR:$reg, moemem:$addr),
+                               "store.w.s $reg -> $addr", []>;
+
+def LOADrr_AS : LoadStoreForm<0b0101, 0b11, (outs AllReg:$reg),
+                               (ins moemem:$addr), "load.w.s $addr -> $reg", []>;
+
+def STORErr_AS : LoadStoreForm<0b0110, 0b11, (outs),
+                                (ins AllReg:$reg, moemem:$addr),
+                                "store.w.s $reg -> $addr", []>;
+
+let bytesel = 0b00, size = 0b01 in // Byte
+def STORErr_BS : LoadStoreForm<0b0110, 0b11, (outs), (ins GPR:$reg, moemem:$addr),
+                                "store.b.s $reg -> $addr", []>;
+
+let bytesel = 0b00, size = 0b10 in // Halfword
+def STORErr_HS : LoadStoreForm<0b0110, 0b11, (outs), (ins GPR:$reg, moemem:$addr),
+                                "store.h.s $reg -> $addr", []>;
+
+let bytesel = 0b00, size = 0b01 in { // Byte
+def LOADrr_BS : LoadStoreForm<0b0101, 0b11, (outs GPR:$reg),
+                               (ins GPR:$oldval, moemem:$addr),
+                               "load.b.s $addr -> $reg", []> {
+  let Constraints = "$reg = $oldval";
+}
+}
+
+let bytesel = 0b00, size = 0b10 in { // Halfword
+def LOADrr_HS : LoadStoreForm<0b0101, 0b11, (outs GPR:$reg),
+                               (ins GPR:$oldval, moemem:$addr),
+                               "load.h.s $addr -> $reg", []> {
+  let Constraints = "$reg = $oldval";
+}
+}
+
+//===----------------------------------------------------------------------===//
 
 let bytesel = 0b00, size = 0b01 in // Byte
 def STORErr_B : LoadStoreForm<0b0110, 0b10, (outs), (ins GPR:$reg, moemem:$addr),

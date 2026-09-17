@@ -9,15 +9,22 @@
 ; llvm-tests/run-globals-test.sh, which also proves the store actually
 ; executes correctly, not just looks plausible in this text-only check).
 
+; The `.s` forms are Addressing mode's short register-indirect: the operand is
+; the halfword after the opcode rather than a word at the next aligned address,
+; so the instruction is one aligned word (isa-evaluation.md's S9). MoeMCInstLower
+; picks it whenever the offset fits twelve signed bits, which every offset here
+; does - so what this file checks now is that it is picked, as well as that the
+; global round-trips.
+
 ; CHECK-LABEL: compute:
 ; CHECK: load.w .LCPI0_0 -> gp0
-; CHECK: load.w [gp0+0] -> gp1
+; CHECK: load.w.s [gp0+0] -> gp1
 ; CHECK: load.w .LCPI0_1 -> gp2
 ; CHECK: add gp1, gp2 -> gp1
-; CHECK: store.w gp1 -> [gp0+0]
-; CHECK: load.w [gp0+0] -> gp0
+; CHECK: store.w.s gp1 -> [gp0+0]
+; CHECK: load.w.s [gp0+0] -> gp0
 ; CHECK: load.w .LCPI0_2 -> gp1
-; CHECK: load.w [gp1+0] -> gp1
+; CHECK: load.w.s [gp1+0] -> gp1
 ; CHECK: add gp0, gp1 -> gp0
 @g = global i32 5
 @z = global i32 0

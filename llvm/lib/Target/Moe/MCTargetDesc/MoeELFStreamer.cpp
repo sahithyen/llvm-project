@@ -68,6 +68,10 @@ namespace {
 struct TrailingOperand {
   int SymOperand = -1;
   int MemBaseOperand = -1;
+  // A short form's operand is the halfword right after the opcode, with no
+  // alignment and no padding, so the whole instruction is four bytes and can
+  // be one aligned word - see 'Addressing mode' in the Encoding chapter.
+  bool Short = false;
 
   bool isAbsolute() const { return SymOperand >= 0; }
   bool exists() const { return SymOperand >= 0 || MemBaseOperand >= 0; }
@@ -106,6 +110,24 @@ TrailingOperand getTrailingOperand(const MCInst &MI) {
   case Moe::LOADrr_H:
     T.MemBaseOperand = 2;
     break;
+  // The short register-indirect twins, chosen by MoeMCInstLower when the
+  // offset fits twelve signed bits. Same operand positions as the long forms
+  // they came from; only the width and the placement of the emitted operand
+  // differ.
+  case Moe::LOADrr_S:
+  case Moe::STORErr_S:
+  case Moe::LOADrr_AS:
+  case Moe::STORErr_AS:
+  case Moe::STORErr_BS:
+  case Moe::STORErr_HS:
+    T.MemBaseOperand = 1;
+    T.Short = true;
+    break;
+  case Moe::LOADrr_BS:
+  case Moe::LOADrr_HS:
+    T.MemBaseOperand = 2;
+    T.Short = true;
+    break;
   default:
     break;
   }
@@ -122,6 +144,27 @@ void MoeELFStreamer::emitInstruction(const MCInst &Inst,
   TrailingOperand T = getTrailingOperand(Inst);
   if (!T.exists())
     return;
+
+  if (T.Short) {
+    // No alignment directive and no padding: the operand is the halfword that
+    // immediately follows, which is what makes the pair one aligned word when
+    // the opcode is at a word-aligned address.
+    const MCOperand &Base = Inst.getOperand(T.MemBaseOperand);
+    const MCOperand &Offset = Inst.getOperand(T.MemBaseOperand + 1);
+    assert(Base.isReg() && "Short register-indirect needs a base register");
+    assert(Offset.isImm() &&
+           "Short register-indirect offset must be a constant - "
+           "MoeMCInstLower only picks this form for one");
+    uint32_t BaseEnc =
+        getContext().getRegisterInfo()->getEncodingValue(Base.getReg());
+    // Base register in bits 3-0 and a 12-bit signed offset in bits 15-4,
+    // mirroring the long form's own layout - and matching
+    // emulator/src/cpu.rs's resolve_trailing_operand.
+    uint16_t Packed = static_cast<uint16_t>(
+        (static_cast<uint32_t>(Offset.getImm()) << 4) | (BaseEnc & 0xF));
+    emitIntValue(Packed, 2);
+    return;
+  }
 
   // Fill with zeroes rather than any instruction pattern: this padding sits
   // between an instruction and its own operand word and is never reached by

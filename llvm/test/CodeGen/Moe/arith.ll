@@ -11,8 +11,8 @@
 ; CHECK: move sp -> gp4
 ; CHECK: sub gp4, gp5 -> gp4
 ; CHECK: move gp4 -> sp
-; CHECK: store.w gp0 -> [sp+0]
-; CHECK: load.w [sp+0] -> gp1
+; CHECK: store.w.s gp0 -> [sp+0]
+; CHECK: load.w.s [sp+0] -> gp1
 ; CHECK: add gp0, gp1 -> gp0
 ; CHECK: add gp4, gp5 -> gp4
 ; CHECK: move gp4 -> sp
@@ -30,8 +30,8 @@ define i32 @alloca_roundtrip(i32 %x) {
 ; CHECK-LABEL: forced_spill:
 ; CHECK: push gp6
 ; CHECK: push gp7
-; CHECK: store.w {{.*}} -> [sp+{{[0-9]+}}] {{.*}}Folded Spill
-; CHECK: load.w [sp+{{[0-9]+}}] -> {{.*}}Folded Reload
+; CHECK: store.w.s {{.*}} -> [sp+{{[0-9]+}}] {{.*}}Folded Spill
+; CHECK: load.w.s [sp+{{[0-9]+}}] -> {{.*}}Folded Reload
 ; CHECK: pop gp7
 ; CHECK: pop gp6
 ; CHECK: pop gp4
