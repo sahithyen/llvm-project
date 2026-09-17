@@ -60,6 +60,7 @@ RelExpr Moe::getRelExpr(RelType type, const Symbol &s,
   // on input.
   switch (type) {
   case R_MOE_PCREL28:
+  case R_MOE_PCREL32:
     return R_PC;
   case R_MOE_32:
   default:
@@ -106,6 +107,7 @@ void Moe::relocate(uint8_t *loc, const Relocation &rel, uint64_t val) const {
   switch (rel.type) {
   case R_MOE_32:
   case R_MOE_RELATIVE:
+  case R_MOE_PCREL32:
     write32le(loc, val);
     break;
   case R_MOE_PCREL28: {

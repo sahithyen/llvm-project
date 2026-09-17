@@ -29,14 +29,21 @@ public:
 protected:
   unsigned getRelocType(const MCFixup &Fixup, const MCValue &Target,
                         bool IsPCRel) const override {
-    // Two shapes of relocatable reference, one per relocation. An absolute
-    // trailing operand (moeaddr/jmptarget/calltarget) is a flat 32-bit address;
-    // a PC-relative one is a 28-bit displacement in the same word's upper bits,
-    // which is what position-independent code uses for all of them (see
-    // MoeFixupKinds.h).
+    // An instruction's trailing operand word is either a flat 32-bit address or
+    // a 28-bit displacement in that word's upper bits, which is what
+    // position-independent code uses for every one of them - see
+    // MoeFixupKinds.h.
+    //
+    // A *data* word is the generic FK_Data_4, and IsPCRel distinguishes the two
+    // things it can mean. `.long sym` is the address; `.long sym - .` is the
+    // distance to it, which the generic ELF writer has already turned into a
+    // PC-relative relocation with the subtrahend folded into the addend by the
+    // time this is asked. Ignoring IsPCRel here - which this did - answers
+    // R_MOE_32 for both, so `.long sym - .` assembled to the plain address of
+    // sym, silently, with no diagnostic anywhere in the pipeline.
     switch (Fixup.getKind()) {
     case FK_Data_4:
-      return ELF::R_MOE_32;
+      return IsPCRel ? ELF::R_MOE_PCREL32 : ELF::R_MOE_32;
     case Moe::fixup_moe_pcrel28:
       return ELF::R_MOE_PCREL28;
     default:

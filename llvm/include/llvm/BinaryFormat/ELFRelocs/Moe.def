@@ -16,3 +16,9 @@ ELF_RELOC(R_MOE_RELATIVE, 2)
 // base register is IA, so the word says "this many bytes from here" and needs
 // no fixing up at load time at all. See MoeFixupKinds.h.
 ELF_RELOC(R_MOE_PCREL28, 3)
+// A whole 32-bit word holding the distance from itself to a symbol, which is
+// what `.long sym - .` means. Data, not an instruction operand: the startup code
+// of a position-independent program uses one to find a symbol it cannot yet name
+// (musl-port/arch/moe/crt_arch.h), and the assembler accepted the syntax and
+// emitted R_MOE_32 for it before this existed.
+ELF_RELOC(R_MOE_PCREL32, 4)
