@@ -18,6 +18,7 @@
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/Target/TargetMachine.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCInst.h"
@@ -100,6 +101,26 @@ bool offsetFitsShortForm(int64_t Offset) {
   return Offset >= -2048 && Offset <= 2047;
 }
 
+// The PC-relative twin of an instruction whose trailing operand is an absolute
+// address, or -1 if there isn't one.
+//
+// These five are every way compiled code names an address: a branch to one of
+// this function's own blocks (JMP/JCC), a call to another function (JMPabs),
+// and a read or write of a constant-pool word (LOADabs/STOREabs). In
+// position-independent code all five become displacements from IA, which is
+// what keeps a PIE's relocations out of .text - see the JMPpc/LOADpc defs in
+// MoeInstrInfo.td.
+int pcRelativeOpcode(unsigned Opc) {
+  switch (Opc) {
+  case Moe::JMP:       return Moe::JMPpc;
+  case Moe::JCC:       return Moe::JCCpc;
+  case Moe::JMPabs:    return Moe::JMPabs_pc;
+  case Moe::LOADabs:   return Moe::LOADpc;
+  case Moe::STOREabs:  return Moe::STOREpc;
+  default:             return -1;
+  }
+}
+
 } // end anonymous namespace
 
 void MoeMCInstLower::Lower(const MachineInstr *MI, MCInst &OutMI) const {
@@ -165,6 +186,22 @@ void MoeMCInstLower::Lower(const MachineInstr *MI, MCInst &OutMI) const {
   // the kernel's text and 2.5% off its instruction T-states, and *costs* 3.4% of
   // a boot on the machine as built, because the denser layout aliases worse in a
   // 32-entry direct-mapped TLB. See isa-evaluation.md's S9 finding.
+  // Position-independent code reaches every address relative to IA instead of
+  // naming it. Done here, at the last possible moment, for the same reason the
+  // short-form rewrite is: the two forms compute the same address and cost the
+  // same, so the choice carries no information any earlier pass needs. Nothing
+  // about register allocation, scheduling or block layout changes.
+  //
+  // The gate is the function's own relocation model rather than a subtarget
+  // feature, so a PIC and a non-PIC translation unit can be compiled by the
+  // same compiler and linked together - which is what building a libc both
+  // ways requires.
+  if (Printer.TM.isPositionIndependent()) {
+    int PcRelOpc = pcRelativeOpcode(OutMI.getOpcode());
+    if (PcRelOpc >= 0)
+      OutMI.setOpcode(PcRelOpc);
+  }
+
   int ShortOpc = shortRegisterIndirectOpcode(OutMI.getOpcode());
   static const bool Disabled = getenv("MOE_NO_SHORT_FORM") != nullptr;
   if (ShortOpc >= 0 && !Disabled) {

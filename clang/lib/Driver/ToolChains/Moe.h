@@ -44,11 +44,17 @@ public:
                              llvm::opt::ArgStringList &CC1Args,
                              Action::OffloadKind) const override;
 
+  // Not position-independent unless asked, but askable. isPICDefaultForced used
+  // to be true here, which is how the driver is told the target cannot do PIC
+  // at all - it then drops -fPIC silently, which is a confusing way to find out
+  // and was how this target's first attempt at a PIE went. It can: every
+  // address a compiled function names is reachable as a displacement from IA
+  // (see MoeFixupKinds.h), so -fPIC costs no instruction and no register.
   bool isPICDefault() const override { return false; }
   bool isPIEDefault(const llvm::opt::ArgList &Args) const override {
     return false;
   }
-  bool isPICDefaultForced() const override { return true; }
+  bool isPICDefaultForced() const override { return false; }
 
   UnwindLibType
   GetUnwindLibType(const llvm::opt::ArgList &Args) const override {

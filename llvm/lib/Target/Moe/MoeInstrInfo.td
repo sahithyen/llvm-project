@@ -511,6 +511,47 @@ def JMPabs : JumpForm<0b00, (outs), (ins calltarget:$dst), "jump.al $dst", []> {
 }
 
 //===----------------------------------------------------------------------===//
+// The PC-relative twins of the three jumps above (Addressing mode = 2,
+// Register-indirect, with IA as the base register). Position-independent code
+// uses these for every branch and every call, and that is not an optimization -
+// it is what keeps a PIE's relocations out of .text.
+//
+// Identical in size and cost to the absolute forms: same 16-bit opcode, same
+// trailing word, same T-states. All that differs is what the word means - a
+// displacement from itself in bits 31-4, with IA's register select in bits 3-0 -
+// and so which relocation applies to it (R_MOE_PCREL28 rather than R_MOE_32).
+// Nothing needs fixing up at load time, which is the entire point.
+//
+// MoeMCInstLower rewrites the absolute forms into these when the function is
+// position-independent; nothing selects them directly, so none carries a
+// pattern. MoeELFStreamer emits their trailing word, and is where IA's base
+// register select is put in.
+//===----------------------------------------------------------------------===//
+
+let isBranch = 1, isTerminator = 1 in {
+  let isBarrier = 1 in
+  def JMPpc : JumpForm<0b10, (outs), (ins jmptarget:$dst), "jump.al.pc $dst",
+                        []> {
+    let cond = 0; // AL
+  }
+
+  let Uses = [F] in
+  def JCCpc : JumpForm<0b10, (outs), (ins jmptarget:$dst, cc:$cond),
+                        "jump.${cond}.pc $dst", []>;
+} // isBranch, isTerminator
+
+// Same reasoning as JMPabs for why this is neither a branch nor a barrier: it
+// is a call's outbound jump, and control comes back to the instruction after
+// it. isCodeGenOnly keeps it out of the assembly matcher, where its mnemonic
+// would collide with JMPpc's - the distinction between them is which kind of
+// symbol the operand is, which assembly text does not express.
+let isCodeGenOnly = 1 in
+def JMPabs_pc : JumpForm<0b10, (outs), (ins calltarget:$dst),
+                          "jump.al.pc $dst", []> {
+  let cond = 0; // AL
+}
+
+//===----------------------------------------------------------------------===//
 // SYSCALL (0b0001) / IRET (0b0010) / INVALIDATE (0b0011) - the three
 // operand-less control-transfer instructions, using MoeInstrFormats.td's
 // NoOperandForm. None of them is ever produced by instruction selection:
@@ -578,6 +619,23 @@ def LOADabs : LoadStoreForm<0b0101, 0b00, (outs GPR:$reg), (ins moeaddr:$addr),
 
 def STOREabs : LoadStoreForm<0b0110, 0b00, (outs), (ins GPR:$reg, moeaddr:$addr),
                               "store.w $reg -> $addr", []>;
+
+// The PC-relative twins, for the same reason as JMPpc/JCCpc above: in
+// position-independent code the constant pool - which is how this target
+// materializes every constant, global address and return-address label, since
+// it has no load-immediate - has to be reached without naming its address.
+//
+// Worth stating plainly, because it is what makes PIC cheap here: a global's
+// address already lived in a pool word that LOADabs dereferenced. That
+// indirection is exactly what a GOT is. Making the *pool* reachable
+// PC-relatively is therefore the whole of the job, and the pool entry itself
+// becomes the GOT slot - patched once at load time by R_MOE_RELATIVE, in
+// .data.rel.ro where a writable relocation belongs.
+def LOADpc : LoadStoreForm<0b0101, 0b10, (outs GPR:$reg), (ins moeaddr:$addr),
+                            "load.w.pc $addr -> $reg", []>;
+
+def STOREpc : LoadStoreForm<0b0110, 0b10, (outs), (ins GPR:$reg, moeaddr:$addr),
+                             "store.w.pc $reg -> $addr", []>;
 
 //===----------------------------------------------------------------------===//
 // LOAD/STORE, Register-indirect addressing mode (mode 2) - used for

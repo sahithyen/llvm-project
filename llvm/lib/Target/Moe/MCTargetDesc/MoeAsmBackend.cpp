@@ -6,6 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "MCTargetDesc/MoeFixupKinds.h"
 #include "MCTargetDesc/MoeMCTargetDesc.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/MC/MCAsmBackend.h"
@@ -32,10 +33,17 @@ public:
     return createMoeELFObjectWriter();
   }
 
-  // Only the generic FK_Data_4 fixup kind is used for Milestone 2 (every
-  // relocatable reference is a flat 32-bit absolute address - see the
-  // Milestone 2 plan) - the base class's handling of it is already correct,
-  // no target-specific fixup kinds/getFixupKindInfo override needed.
+  // Two fixup kinds, and they are shaped quite differently. An absolute
+  // reference is the generic FK_Data_4 over a whole word, which the base class
+  // already handles correctly. A PC-relative one writes a 28-bit field with
+  // four bits of base-register select underneath it, which nothing generic
+  // knows how to do - hence both overrides below.
+  MCFixupKindInfo getFixupKindInfo(MCFixupKind Kind) const override {
+    if (Kind == Moe::fixup_moe_pcrel28)
+      return {"fixup_moe_pcrel28", /*TargetOffset=*/4, /*TargetSize=*/28,
+              /*Flags=*/0};
+    return MCAsmBackend::getFixupKindInfo(Kind);
+  }
 
   bool writeNopData(raw_ostream &OS, uint64_t Count,
                     const MCSubtargetInfo *STI) const override;
@@ -47,6 +55,29 @@ void MoeAsmBackend::applyFixup(const MCFragment &F, const MCFixup &Fixup,
   maybeAddReloc(F, Fixup, Target, Value, IsResolved);
   if (!Value)
     return;
+
+  if (Fixup.getKind() == Moe::fixup_moe_pcrel28) {
+    // The displacement occupies bits 31-4, so it is shifted into place rather
+    // than written where it lies - and the four bits underneath it are the base
+    // register select the streamer has already put there, which is why the
+    // OR-in below must not disturb them.
+    //
+    // Range is checked rather than truncated: 28 signed bits reach +-128 MiB,
+    // which nothing here comes close to, and a silent wrap would produce a
+    // program that jumps somewhere plausible instead of one that fails to link.
+    int64_t Displacement = static_cast<int64_t>(Value);
+    if (!isInt<28>(Displacement)) {
+      Asm->getContext().reportError(
+          Fixup.getLoc(),
+          "PC-relative displacement of " + Twine(Displacement) +
+              " does not fit in the 28 signed bits of a trailing operand word");
+      return;
+    }
+    uint32_t Field = static_cast<uint32_t>(Displacement) << 4;
+    for (unsigned i = 0; i != 4; ++i)
+      Data[i] |= uint8_t((Field >> (i * 8)) & 0xff);
+    return;
+  }
 
   MCFixupKindInfo Info = getFixupKindInfo(Fixup.getKind());
   unsigned NumBytes = alignTo(Info.TargetSize + Info.TargetOffset, 8) / 8;

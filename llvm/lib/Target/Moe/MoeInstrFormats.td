@@ -72,7 +72,7 @@ def MOECC_LE : MoeCC<15>;
 //===----------------------------------------------------------------------===//
 // Per-opcode formats. Field names match specification/src/instruction_set.md
 // exactly. "Addressing mode" (JUMP/LOAD/STORE, 2 bits) is a plain literal
-// (0 = Absolute, 1 = PC-relative, 2 = Register-indirect, 3 = Short
+// (0 = Absolute, 1 = Short absolute, 2 = Register-indirect, 3 = Short
 // register-indirect) rather than a named enum like MoeCC, since only two
 // format classes (JumpForm, LoadStoreForm) ever need it and each instruction
 // def below picks a fixed value - see 'Addressing mode' in the Encoding

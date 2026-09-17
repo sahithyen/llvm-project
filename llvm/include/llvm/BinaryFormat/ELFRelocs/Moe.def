@@ -10,3 +10,9 @@ ELF_RELOC(R_MOE_32,   1)
 // possible on this target - see lld/ELF/Arch/Moe.cpp and musl-port's
 // self-relocating entry.
 ELF_RELOC(R_MOE_RELATIVE, 2)
+// A 28-bit signed PC-relative displacement in bits 31-4 of a Register-indirect
+// trailing operand word, leaving the base register select in bits 3-0 alone.
+// This is what position-independent code on this target is built out of: the
+// base register is IA, so the word says "this many bytes from here" and needs
+// no fixing up at load time at all. See MoeFixupKinds.h.
+ELF_RELOC(R_MOE_PCREL28, 3)

@@ -55,11 +55,16 @@ Moe::Moe(Ctx &ctx) : TargetInfo(ctx) {
 
 RelExpr Moe::getRelExpr(RelType type, const Symbol &s,
                         const uint8_t *loc) const {
-  // R_MOE_32 is the only relocation the assembler emits: every relocatable
-  // reference is a flat 32-bit absolute address (see MoeMCCodeEmitter.cpp and
-  // MoeELFObjectWriter.cpp). R_MOE_RELATIVE is the linker's own, and is never
-  // seen on input.
-  return R_ABS;
+  // Two relocations reach here, one per addressing form the assembler emits
+  // (MoeELFStreamer.cpp). R_MOE_RELATIVE is the linker's own and is never seen
+  // on input.
+  switch (type) {
+  case R_MOE_PCREL28:
+    return R_PC;
+  case R_MOE_32:
+  default:
+    return R_ABS;
+  }
 }
 
 int64_t Moe::getImplicitAddend(const uint8_t *buf, RelType type) const {
@@ -83,12 +88,17 @@ RelType Moe::getDynRel(RelType type) const {
   // executable be rewritten as "add the load bias", rather than being rejected
   // for having no link-time answer.
   //
-  // Moe needs it for *every* address, and that is a consequence of the
-  // encoding rather than of the compiler: JUMP/LOAD/STORE carry their operand
-  // in a trailing word inside .text, so a position-independent program's
-  // relocations land in an executable section. That is what DT_TEXTREL means,
-  // and it is why linking one needs `-z notext` until the backend can put
-  // addresses in a GOT instead.
+  // What survives is only what is in *data*: a pointer in .data, and the
+  // constant-pool word that holds a global's address, which the compiler now
+  // puts in .data.rel.ro. Code needs nothing, because a position-independent
+  // function reaches every address as a displacement from IA (R_MOE_PCREL28),
+  // which the linker resolves once and for all.
+  //
+  // It read differently not long ago. JUMP/LOAD/STORE carry their operand in a
+  // trailing word inside .text, so when the compiler emitted absolute addresses
+  // there, a PIE's relocations landed in an executable section - DT_TEXTREL, and
+  // `-z notext` to permit it. Nothing about the encoding forced that; what
+  // forced it was that the backend had no PC-relative relocation to emit.
   return type == R_MOE_32 ? R_MOE_32 : 0;
 }
 
@@ -98,6 +108,16 @@ void Moe::relocate(uint8_t *loc, const Relocation &rel, uint64_t val) const {
   case R_MOE_RELATIVE:
     write32le(loc, val);
     break;
+  case R_MOE_PCREL28: {
+    // Bits 31-4 only: the low nibble is the base register select (IA), which
+    // the assembler put there and which this must leave standing. Writing the
+    // whole word - the obvious thing, and what R_MOE_32 above does - would
+    // zero it and turn every PC-relative reference into a GP0-relative one.
+    checkInt(ctx, loc, static_cast<int64_t>(val), 28, rel);
+    uint32_t base = read32le(loc) & 0xf;
+    write32le(loc, (static_cast<uint32_t>(val) << 4) | base);
+    break;
+  }
   default:
     Err(ctx) << getErrorLoc(ctx, loc) << "unrecognized relocation " << rel.type;
   }

@@ -46,6 +46,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "MoeELFStreamer.h"
+#include "MoeFixupKinds.h"
 #include "MoeMCTargetDesc.h"
 #include "llvm/MC/MCAsmBackend.h"
 #include "llvm/MC/MCCodeEmitter.h"
@@ -72,10 +73,20 @@ struct TrailingOperand {
   // alignment and no padding, so the whole instruction is four bytes and can
   // be one aligned word - see 'Addressing mode' in the Encoding chapter.
   bool Short = false;
+  // A PC-relative form: one symbolic operand, like the absolute forms, but the
+  // word holds a displacement from itself in bits 31-4 and IA's base register
+  // select in bits 3-0 rather than a whole address. See MoeFixupKinds.h.
+  bool PcRel = false;
 
   bool isAbsolute() const { return SymOperand >= 0; }
   bool exists() const { return SymOperand >= 0 || MemBaseOperand >= 0; }
 };
+
+// IA's 'Register selection' value, per MoeRegisterInfo.td and 'Base register
+// selection' in the Encoding chapter. Written out rather than looked up: the
+// PC-relative forms have no base-register operand to read it from, because
+// which register it is is the whole meaning of the addressing form.
+constexpr uint32_t IARegSelect = 8;
 
 TrailingOperand getTrailingOperand(const MCInst &MI) {
   TrailingOperand T;
@@ -90,6 +101,20 @@ TrailingOperand getTrailingOperand(const MCInst &MI) {
   case Moe::LOADabs_A:
   case Moe::STOREabs_A:
     T.SymOperand = 1;
+    break;
+  // The PC-relative forms, which position-independent code uses in place of
+  // every one of the absolute forms above. Same operand positions - all that
+  // changes is how the word they emit is to be read.
+  case Moe::JMPpc:
+  case Moe::JCCpc:
+  case Moe::JMPabs_pc:
+    T.SymOperand = 0;
+    T.PcRel = true;
+    break;
+  case Moe::LOADpc:
+  case Moe::STOREpc:
+    T.SymOperand = 1;
+    T.PcRel = true;
     break;
   case Moe::LOADrr:
   case Moe::STORErr:
@@ -173,6 +198,34 @@ void MoeELFStreamer::emitInstruction(const MCInst &Inst,
   // opcodes are real instructions).
   emitValueToAlignment(Align(4), /*Fill=*/0, /*FillLen=*/1,
                        /*MaxBytesToEmit=*/0);
+
+  if (T.PcRel) {
+    const MCOperand &MO = Inst.getOperand(T.SymOperand);
+    assert(MO.isExpr() && "A PC-relative trailing operand names a symbol - a "
+                          "bare address has nothing to be relative to");
+    MCContext &Ctx = getContext();
+
+    // The displacement the hardware wants is measured from the *end* of this
+    // word, because that is where IA stands by the time the operand resolves
+    // (emulator/src/cpu.rs sets IA past the operand before computing the
+    // effective address). The fixup itself is relative to the word's own
+    // address, so the four-byte difference is carried as an addend - which
+    // works out identically whether MC resolves the fixup itself or leaves a
+    // relocation for the linker, since both add it in.
+    const MCExpr *Expr = MCBinaryExpr::createSub(
+        MO.getExpr(), MCConstantExpr::create(4, Ctx), Ctx);
+
+    // Emitted by hand rather than through emitValue, because no generic path
+    // can place a fixup of a target-specific kind over bytes that already hold
+    // something - and these bytes do: the low nibble is IA's register select,
+    // which the relocation deliberately leaves alone.
+    ensureHeadroom(4);
+    getCurrentFragment()->addFixup(MCFixup::create(
+        getCurFragSize(), Expr, Moe::fixup_moe_pcrel28, /*PCRel=*/true));
+    const char Word[4] = {static_cast<char>(IARegSelect), 0, 0, 0};
+    appendContents(Word);
+    return;
+  }
 
   if (T.isAbsolute()) {
     const MCOperand &MO = Inst.getOperand(T.SymOperand);
