@@ -519,6 +519,24 @@ SDValue MoeTargetLowering::LowerDYNAMIC_STACKALLOC(SDValue Op,
   return DAG.getMergeValues({Allocated, Chain}, dl);
 }
 
+/// How many bits of SHIFT's Amount field the code being generated may use.
+///
+/// Two is what the hardware has (see `specification/src/instruction_set.md`'s
+/// SHIFT section). MOE_SHIFT_AMOUNT_BITS=0 or 1 narrows it so that the same
+/// source can be built for a machine with a narrower field and the two runs
+/// compared; MOE_NO_SHIFT_AMOUNT is the older spelling of 0 and still works,
+/// since `tools/` scripts and `isa-evaluation.md` both name it.
+static unsigned moeShiftAmountBits() {
+  static const unsigned Bits = [] {
+    if (const char *Env = std::getenv("MOE_SHIFT_AMOUNT_BITS")) {
+      long Requested = std::atol(Env);
+      return Requested <= 0 ? 0u : Requested == 1 ? 1u : 2u;
+    }
+    return std::getenv("MOE_NO_SHIFT_AMOUNT") != nullptr ? 0u : 2u;
+  }();
+  return Bits;
+}
+
 SDValue MoeTargetLowering::LowerShifts(SDValue Op, SelectionDAG &DAG) const {
   SDNode *N = Op.getNode();
   EVT VT = Op.getValueType();
@@ -570,26 +588,33 @@ SDValue MoeTargetLowering::LowerShifts(SDValue Op, SelectionDAG &DAG) const {
   // odd. The odd one goes first so that the common `shift by 1` stays exactly
   // the instruction it was.
   //
-  // MOE_NO_SHIFT_AMOUNT emits the old chain instead, so that the same source
-  // can be built both ways and measured - the pairing MOE_NO_SHORT_FORM and
-  // MOE_NO_SHORT_BRANCH already exist for, and for the same reason: comparing
-  // against a number taken before some other commit compares two things that
-  // differ in more than one way.
-  static const bool NoAmount = std::getenv("MOE_NO_SHIFT_AMOUNT") != nullptr;
-
+  // MOE_SHIFT_AMOUNT_BITS emits a narrower Amount field's code instead, so
+  // that the same source can be built each way and measured - the pairing
+  // MOE_NO_SHORT_FORM and MOE_NO_SHORT_BRANCH already exist for, and for the
+  // same reason: comparing against a number taken before some other commit
+  // compares two things that differ in more than one way. Here it has to be
+  // graduated rather than a flag, because the field is being widened from one
+  // bit to two and what needs pricing is that step, not the whole feature.
   uint64_t ShiftAmount = Amt->getZExtValue();
   SDValue Result = N->getOperand(0);
-  if (NoAmount) {
+  unsigned Bits = moeShiftAmountBits();
+  if (Bits == 0) {
     while (ShiftAmount--)
       Result = DAG.getNode(SingleBitOpc, dl, VT, Result);
     return Result;
   }
   // The remainder first, so that a shift by one is exactly the instruction it
-  // always was, then as many four-bit shifts as fit. A shift by n is n/4 + at
-  // most one instruction, where before N3 it was n.
+  // always was, then as many of the widest shift as fit. A shift by n is
+  // n/4 + at most two instructions with two Amount bits, n/2 + at most one
+  // with one, and n without the field at all.
   if (ShiftAmount % 2) {
     Result = DAG.getNode(SingleBitOpc, dl, VT, Result);
     --ShiftAmount;
+  }
+  if (Bits == 1) {
+    for (uint64_t Pair = ShiftAmount / 2; Pair--;)
+      Result = DAG.getNode(TwoBitOpc, dl, VT, Result);
+    return Result;
   }
   if (ShiftAmount % 4) {
     Result = DAG.getNode(TwoBitOpc, dl, VT, Result);
@@ -1529,10 +1554,13 @@ MachineBasicBlock *MoeTargetLowering::emitVarShift(MachineInstr &MI,
     // instead of 31, and a quarter as many executed for any given amount. 2^K
     // is a multiple of four for every K but 0 and 1, which take one instruction
     // each anyway.
-    static const bool NoAmount = std::getenv("MOE_NO_SHIFT_AMOUNT") != nullptr;
+    unsigned Bits = moeShiftAmountBits();
     unsigned Count = 1u << K;
     Register Shifted = Value;
-    if (!NoAmount) {
+    unsigned PairOpc = ShiftOpc == Moe::SHL   ? Moe::SHL2
+                       : ShiftOpc == Moe::SRL ? Moe::SRL2
+                                              : Moe::SRA2;
+    if (Bits >= 2) {
       unsigned WideOpc = ShiftOpc == Moe::SHL   ? Moe::SHL4
                          : ShiftOpc == Moe::SRL ? Moe::SRL4
                                                 : Moe::SRA4;
@@ -1542,15 +1570,14 @@ MachineBasicBlock *MoeTargetLowering::emitVarShift(MachineInstr &MI,
         Shifted = Next;
       }
       Count %= 4;
-      if (Count == 2) {
-        unsigned PairOpc = ShiftOpc == Moe::SHL   ? Moe::SHL2
-                           : ShiftOpc == Moe::SRL ? Moe::SRL2
-                                                  : Moe::SRA2;
+    }
+    if (Bits >= 1) {
+      for (unsigned I = 0; I < Count / 2; ++I) {
         Register Next = MRI.createVirtualRegister(RC);
         BuildMI(ShiftBB, DL, TII->get(PairOpc), Next).addReg(Shifted);
         Shifted = Next;
-        Count = 0;
       }
+      Count %= 2;
     }
     for (unsigned I = 0; I < Count; ++I) {
       Register Next = MRI.createVirtualRegister(RC);
