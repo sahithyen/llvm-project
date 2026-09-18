@@ -35,6 +35,11 @@ enum NodeType {
   SHL2,
   SRL2,
   SRA2,
+  // And by four - the second amount bit. There is no by-three node: a shift by
+  // three is by-two then by-one, which LowerShifts already builds.
+  SHL4,
+  SRL4,
+  SRA4,
 };
 }
 

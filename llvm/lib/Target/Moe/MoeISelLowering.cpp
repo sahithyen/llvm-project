@@ -526,21 +526,25 @@ SDValue MoeTargetLowering::LowerShifts(SDValue Op, SelectionDAG &DAG) const {
 
   unsigned SingleBitOpc;
   unsigned TwoBitOpc;
+  unsigned FourBitOpc;
   unsigned RealOpc; // Moe::SHL/SRL/SRA - the loop body emitVarShift builds.
   switch (Op.getOpcode()) {
   case ISD::SHL:
     SingleBitOpc = MoeISD::SHL1;
     TwoBitOpc = MoeISD::SHL2;
+    FourBitOpc = MoeISD::SHL4;
     RealOpc = Moe::SHL;
     break;
   case ISD::SRL:
     SingleBitOpc = MoeISD::SRL1;
     TwoBitOpc = MoeISD::SRL2;
+    FourBitOpc = MoeISD::SRL4;
     RealOpc = Moe::SRL;
     break;
   case ISD::SRA:
     SingleBitOpc = MoeISD::SRA1;
     TwoBitOpc = MoeISD::SRA2;
+    FourBitOpc = MoeISD::SRA4;
     RealOpc = Moe::SRA;
     break;
   default:
@@ -580,12 +584,19 @@ SDValue MoeTargetLowering::LowerShifts(SDValue Op, SelectionDAG &DAG) const {
       Result = DAG.getNode(SingleBitOpc, dl, VT, Result);
     return Result;
   }
+  // The remainder first, so that a shift by one is exactly the instruction it
+  // always was, then as many four-bit shifts as fit. A shift by n is n/4 + at
+  // most one instruction, where before N3 it was n.
   if (ShiftAmount % 2) {
     Result = DAG.getNode(SingleBitOpc, dl, VT, Result);
     --ShiftAmount;
   }
-  for (uint64_t Pair = ShiftAmount / 2; Pair--;)
+  if (ShiftAmount % 4) {
     Result = DAG.getNode(TwoBitOpc, dl, VT, Result);
+    ShiftAmount -= 2;
+  }
+  for (uint64_t Quad = ShiftAmount / 4; Quad--;)
+    Result = DAG.getNode(FourBitOpc, dl, VT, Result);
   return Result;
 }
 
@@ -1513,23 +1524,33 @@ MachineBasicBlock *MoeTargetLowering::emitVarShift(MachineInstr &MI,
     ShiftBB->addSuccessor(MergeBB);
 
     // Block K shifts by 2^K when bit K of the amount is set. That is 2^K
-    // single-bit shifts, or half as many two-bit ones since candidate N3 gave
-    // SHIFT an Amount field - 16 instructions across the five blocks instead of
-    // 31, and about half as many executed for any given amount. 2^K is even for
-    // every K but 0, so only the first block keeps a single-bit shift.
+    // single-bit shifts, or a quarter as many four-bit ones since candidate N3
+    // gave SHIFT a two-bit Amount field - 9 instructions across the five blocks
+    // instead of 31, and a quarter as many executed for any given amount. 2^K
+    // is a multiple of four for every K but 0 and 1, which take one instruction
+    // each anyway.
     static const bool NoAmount = std::getenv("MOE_NO_SHIFT_AMOUNT") != nullptr;
     unsigned Count = 1u << K;
     Register Shifted = Value;
     if (!NoAmount) {
-      unsigned WideOpc = ShiftOpc == Moe::SHL   ? Moe::SHL2
-                         : ShiftOpc == Moe::SRL ? Moe::SRL2
-                                                : Moe::SRA2;
-      for (unsigned I = 0; I < Count / 2; ++I) {
+      unsigned WideOpc = ShiftOpc == Moe::SHL   ? Moe::SHL4
+                         : ShiftOpc == Moe::SRL ? Moe::SRL4
+                                                : Moe::SRA4;
+      for (unsigned I = 0; I < Count / 4; ++I) {
         Register Next = MRI.createVirtualRegister(RC);
         BuildMI(ShiftBB, DL, TII->get(WideOpc), Next).addReg(Shifted);
         Shifted = Next;
       }
-      Count %= 2;
+      Count %= 4;
+      if (Count == 2) {
+        unsigned PairOpc = ShiftOpc == Moe::SHL   ? Moe::SHL2
+                           : ShiftOpc == Moe::SRL ? Moe::SRL2
+                                                  : Moe::SRA2;
+        Register Next = MRI.createVirtualRegister(RC);
+        BuildMI(ShiftBB, DL, TII->get(PairOpc), Next).addReg(Shifted);
+        Shifted = Next;
+        Count = 0;
+      }
     }
     for (unsigned I = 0; I < Count; ++I) {
       Register Next = MRI.createVirtualRegister(RC);

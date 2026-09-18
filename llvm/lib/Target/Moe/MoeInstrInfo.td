@@ -49,6 +49,9 @@ def Moeshl1 : SDNode<"MoeISD::SHL1", SDTIntUnaryOp>;
 def Moeshl2 : SDNode<"MoeISD::SHL2", SDTIntUnaryOp>;
 def Moesrl2 : SDNode<"MoeISD::SRL2", SDTIntUnaryOp>;
 def Moesra2 : SDNode<"MoeISD::SRA2", SDTIntUnaryOp>;
+def Moeshl4 : SDNode<"MoeISD::SHL4", SDTIntUnaryOp>;
+def Moesrl4 : SDNode<"MoeISD::SRL4", SDTIntUnaryOp>;
+def Moesra4 : SDNode<"MoeISD::SRA4", SDTIntUnaryOp>;
 def Moesrl1 : SDNode<"MoeISD::SRL1", SDTIntUnaryOp>;
 def Moesra1 : SDNode<"MoeISD::SRA1", SDTIntUnaryOp>;
 
@@ -452,6 +455,23 @@ def SRL2 : ShiftForm<(outs GPR:$o), (ins GPR:$a), "shift.right.2 $a -> $o",
 let right = 1, arithmetic = 1, amount = 1 in
 def SRA2 : ShiftForm<(outs GPR:$o), (ins GPR:$a), "shift.right.arith.2 $a -> $o",
                       [(set GPR:$o, (Moesra2 GPR:$a))]>;
+
+// And by four, which is the whole of what the second amount bit buys: a
+// constant shift by n is now n/4 of these plus at most one smaller shift.
+// Three is deliberately not given a def or a node - LowerShifts only ever needs
+// the largest amount and a single remainder step, so a shift by three is by-two
+// then by-one, and a def nothing emits is a def nothing tests.
+let right = 0, amount = 3 in
+def SHL4 : ShiftForm<(outs GPR:$o), (ins GPR:$a), "shift.left.4 $a -> $o",
+                      [(set GPR:$o, (Moeshl4 GPR:$a))]>;
+
+let right = 1, arithmetic = 0, amount = 3 in
+def SRL4 : ShiftForm<(outs GPR:$o), (ins GPR:$a), "shift.right.4 $a -> $o",
+                      [(set GPR:$o, (Moesrl4 GPR:$a))]>;
+
+let right = 1, arithmetic = 1, amount = 3 in
+def SRA4 : ShiftForm<(outs GPR:$o), (ins GPR:$a), "shift.right.arith.4 $a -> $o",
+                      [(set GPR:$o, (Moesra4 GPR:$a))]>;
 
 let right = 0, carryin = 1 in
 def SHLc : ShiftForm<(outs GPR:$o), (ins GPR:$a), "shift.left.c $a -> $o", []>;
