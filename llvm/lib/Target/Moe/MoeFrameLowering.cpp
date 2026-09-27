@@ -22,6 +22,7 @@
 #include "MoeFrameLowering.h"
 #include "MoeInstrInfo.h"
 #include "MoeMachineFunctionInfo.h"
+#include "MoeMulDivMarks.h"
 #include "MoeSubtarget.h"
 #include "llvm/CodeGen/MachineConstantPool.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
@@ -116,6 +117,26 @@ static void adjustStackPointer(MachineBasicBlock &MBB,
       .setMIFlag(Flag);
 }
 
+// Candidate L8's pricing marker for a function that is itself a 64-bit
+// multiply or divide helper (MoeMulDivMarks.h). Only ever at the very edges -
+// before the callee-saved PUSHes and after the POPs - because the epilogue
+// finds its POPs by walking back from the return, and anything else in
+// between would stop that walk.
+static void markMulDivHelper(MachineFunction &MF, MachineBasicBlock &MBB,
+                             MachineBasicBlock::iterator I,
+                             const TargetInstrInfo &TII, bool Begin) {
+  if (!MoeMulDivMark::enabled())
+    return;
+  unsigned Code = MoeMulDivMark::helperBegin(MF.getName());
+  if (!Code)
+    return;
+  DebugLoc DL = I != MBB.end() ? I->getDebugLoc() : DebugLoc();
+  // GP0 carries nothing the profile wants here, and may hold nothing at all.
+  BuildMI(MBB, I, DL, TII.get(Moe::MULDIVMARK))
+      .addReg(Moe::GP0, RegState::Undef)
+      .addImm(Begin ? Code : Code + 1);
+}
+
 void MoeFrameLowering::emitPrologue(MachineFunction &MF,
                                     MachineBasicBlock &MBB) const {
   assert(&MF.front() == &MBB && "Shrink-wrapping not yet supported");
@@ -199,6 +220,8 @@ void MoeFrameLowering::emitPrologue(MachineFunction &MF,
     BuildMI(MBB, MBBI, DL, TII.get(Moe::MOVE), Moe::GP7)
         .addReg(Moe::SP)
         .setMIFlag(MachineInstr::FrameSetup);
+
+  markMulDivHelper(MF, MBB, MBB.begin(), TII, /*Begin=*/true);
 }
 
 void MoeFrameLowering::emitEpilogue(MachineFunction &MF,
@@ -244,12 +267,11 @@ void MoeFrameLowering::emitEpilogue(MachineFunction &MF,
   // before the frame was allocated *and* before SP was aligned down, so it is
   // exactly the stack pointer the callee-saved POPs below expect. Adding
   // NumBytes back would overshoot by however much the alignment moved SP.
-  if (needsRealignment(MF))
-    return;
-
-  if (NumBytes)
+  if (!needsRealignment(MF) && NumBytes)
     adjustStackPointer(MBB, MBBI, DL, TII, MF, -(int64_t)NumBytes,
                         MachineInstr::FrameDestroy);
+
+  markMulDivHelper(MF, MBB, MBB.getFirstTerminator(), TII, /*Begin=*/false);
 }
 
 bool MoeFrameLowering::spillCalleeSavedRegisters(

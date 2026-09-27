@@ -13,6 +13,7 @@
 #include "MoeISelLowering.h"
 #include <cstdlib>
 #include "MoeConstantPoolValue.h"
+#include "MoeMulDivMarks.h"
 #include "MoeMachineFunctionInfo.h"
 #include "MoeSubtarget.h"
 #include "MoeTargetMachine.h"
@@ -1346,6 +1347,31 @@ MachineBasicBlock *MoeTargetLowering::emitCall(MachineInstr &MI,
 // MOVE, none of which touch F.
 //===----------------------------------------------------------------------===//
 
+// Candidate L8's pricing marker - a no-op unless MOE_MULDIV_MARKERS is set.
+// See MoeMulDivMarks.h.
+// Reg is what the profile reads at the marker: the multiplier or divisor at a
+// begin marker, the result at an end one.
+static void emitMulDivMark(MachineBasicBlock &MBB,
+                           MachineBasicBlock::iterator I, const DebugLoc &DL,
+                           const TargetInstrInfo *TII, unsigned Code,
+                           Register Reg) {
+  if (MoeMulDivMark::enabled())
+    BuildMI(MBB, I, DL, TII->get(Moe::MULDIVMARK)).addReg(Reg).addImm(Code);
+}
+
+// Whether a multiply's or divide's second operand is a compile-time constant -
+// every constant here is a constant-pool LOADabs (see LowerConstantPool), so
+// that is what its definition is. A constant operand is what a shift-and-add
+// sequence could replace without any hardware, which is the price L8 has to be
+// measured against rather than the loop.
+static bool isConstantOperand(const MachineRegisterInfo &MRI, Register Reg) {
+  const MachineInstr *Def = Reg.isVirtual() ? MRI.getVRegDef(Reg) : nullptr;
+  while (Def && Def->isCopy() && Def->getOperand(1).getReg().isVirtual())
+    Def = MRI.getVRegDef(Def->getOperand(1).getReg());
+  return Def && Def->getOpcode() == Moe::LOADabs && Def->getNumOperands() > 1 &&
+         Def->getOperand(1).isCPI();
+}
+
 MachineBasicBlock *MoeTargetLowering::emitMul(MachineInstr &MI,
                                                MachineBasicBlock *BB) const {
   const TargetInstrInfo *TII = BB->getParent()->getSubtarget().getInstrInfo();
@@ -1400,6 +1426,10 @@ MachineBasicBlock *MoeTargetLowering::emitMul(MachineInstr &MI,
   Register RExit = MRI.createVirtualRegister(RC);
 
   // BB
+  bool ConstB = isConstantOperand(MRI, BReg);
+  emitMulDivMark(*BB, MI, DL, TII,
+                 ConstB ? MoeMulDivMark::Mul32KBegin : MoeMulDivMark::Mul32Begin,
+                 BReg);
   BuildMI(*BB, MI, DL, TII->get(TargetOpcode::COPY), A0).addReg(AReg);
   BuildMI(*BB, MI, DL, TII->get(TargetOpcode::COPY), B0).addReg(BReg);
   BuildMI(*BB, MI, DL, TII->get(Moe::XOR), R0).addReg(A0).addReg(A0);
@@ -1454,6 +1484,9 @@ MachineBasicBlock *MoeTargetLowering::emitMul(MachineInstr &MI,
       .addReg(RAddExit).addMBB(AddExitBB);
   BuildMI(*ExitBB, ExitBegin, DL, TII->get(TargetOpcode::COPY), DstReg)
       .addReg(RExit);
+  emitMulDivMark(*ExitBB, ExitBegin, DL, TII,
+                 ConstB ? MoeMulDivMark::Mul32KEnd : MoeMulDivMark::Mul32End,
+                 DstReg);
 
   MI.eraseFromParent();
   return ExitBB;
@@ -1703,6 +1736,11 @@ MachineBasicBlock *MoeTargetLowering::emitDivRem(MachineInstr &MI,
   Register BoundZero = MRI.createVirtualRegister(RC);
 
   // BB
+  bool ConstB = isConstantOperand(MRI, BReg);
+  emitMulDivMark(*BB, MI, DL, TII,
+                 ConstB ? MoeMulDivMark::UDivRem32KBegin
+                        : MoeMulDivMark::UDivRem32Begin,
+                 BReg);
   BuildMI(*BB, MI, DL, TII->get(TargetOpcode::COPY), Dividend0).addReg(AReg);
   BuildMI(*BB, MI, DL, TII->get(TargetOpcode::COPY), Divisor0).addReg(BReg);
   BuildMI(*BB, MI, DL, TII->get(Moe::XOR), Remainder0)
@@ -1777,6 +1815,12 @@ MachineBasicBlock *MoeTargetLowering::emitDivRem(MachineInstr &MI,
       .addImm(MoeCC::COND_NE);
 
   // ExitBB: ContinueBB is ExitBB's only predecessor, so plain COPYs suffice.
+  // The end marker goes in first so that the COPYs, each inserted at begin(),
+  // land in front of it.
+  emitMulDivMark(*ExitBB, ExitBB->begin(), DL, TII,
+                 ConstB ? MoeMulDivMark::UDivRem32KEnd
+                        : MoeMulDivMark::UDivRem32End,
+                 QuotientDst);
   BuildMI(*ExitBB, ExitBB->begin(), DL, TII->get(TargetOpcode::COPY),
           RemainderDst)
       .addReg(RemainderNext);
@@ -2043,6 +2087,7 @@ MachineBasicBlock *MoeTargetLowering::emitSDivRem(MachineInstr &MI,
 
   Register ZeroReg = MRI.createVirtualRegister(RC);
   Register SignXor = MRI.createVirtualRegister(RC);
+  emitMulDivMark(*EntryBB, MI, DL, TII, MoeMulDivMark::SDivRem32Begin, BReg);
   BuildMI(*EntryBB, MI, DL, TII->get(Moe::XOR), ZeroReg)
       .addReg(AReg)
       .addReg(AReg);
@@ -2188,6 +2233,8 @@ MachineBasicBlock *MoeTargetLowering::emitSDivRem(MachineInstr &MI,
   BuildMI(*ExitBB, ExitBB->end(), DL, TII->get(TargetOpcode::COPY),
           QuotientDst)
       .addReg(FinalQuotient);
+  emitMulDivMark(*ExitBB, ExitBB->end(), DL, TII,
+                 MoeMulDivMark::SDivRem32End, QuotientDst);
 
   ExitBB->splice(ExitBB->end(), TailScratch, TailScratch->begin(),
                  TailScratch->end());

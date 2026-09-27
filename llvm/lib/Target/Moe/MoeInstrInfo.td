@@ -300,6 +300,19 @@ def VARSHIFTPSEUDO : MoePseudo<(outs GPR:$dst),
 let mask = 0b1111 in
 def MOVE : MoveForm<(outs AllReg:$to), (ins AllReg:$from), "move $from -> $to", []>;
 
+// A pricing marker for candidate L8: `MOVE r -> r` with a code in the reserved
+// bits 8-11, which an implementation never examines. Emitted only under
+// MOE_MULDIV_MARKERS - see MoeMulDivMarks.h. The register is the operation's
+// multiplier or divisor, so that the profile can see the value it ran with;
+// markers that have nothing to report name GP0. Side effects so that nothing
+// moves a loop's code across it; codegen-only because nothing writes one by
+// hand except as a `.short` (mul64.S).
+let hasSideEffects = 1, isCodeGenOnly = 1 in
+def MULDIVMARK : MoveForm<(outs), (ins AllReg:$from, i32imm:$mask),
+                          "muldivmark $mask, $from", []> {
+  let to = from;
+}
+
 //===----------------------------------------------------------------------===//
 // ADD (0b1001) / SUB (0b1010) - word size, no carry-in (i32 fits in one
 // register; multi-word carry chains aren't needed by Milestone 1).
