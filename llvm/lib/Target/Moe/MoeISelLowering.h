@@ -70,6 +70,8 @@ public:
   SDValue LowerSETCC(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerSELECT_CC(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerMUL(SDValue Op, SelectionDAG &DAG) const;
+  SDValue lowerMulByConstant(SDValue X, uint32_t C, const SDLoc &dl,
+                             SelectionDAG &DAG) const;
   SDValue LowerUDIV(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerUREM(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerSDIV(SDValue Op, SelectionDAG &DAG) const;

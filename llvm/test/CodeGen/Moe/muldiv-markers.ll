@@ -1,10 +1,12 @@
 ; Candidate L8's pricing markers (MoeMulDivMarks.h): emitted only under
 ; MOE_MULDIV_MARKERS, naming the multiplier or divisor at a begin marker, with
 ; a constant second operand given its own code, and whole 64-bit helpers
-; bracketed at their prologue and epilogue.
+; bracketed at their prologue and epilogue. MOE_NO_SHIFT_ADD_MUL, because a
+; multiply by a constant is otherwise no loop at all (mul-const.ll) - and the
+; constant codes still have to work for the arm that measures that.
 ; RUN: llc -mtriple=moe -O2 < %s | FileCheck %s --check-prefix=OFF
-; RUN: env MOE_MULDIV_MARKERS=1 llc -mtriple=moe -O2 -verify-machineinstrs < %s \
-; RUN:   | FileCheck %s
+; RUN: env MOE_MULDIV_MARKERS=1 MOE_NO_SHIFT_ADD_MUL=1 \
+; RUN:   llc -mtriple=moe -O2 -verify-machineinstrs < %s | FileCheck %s
 
 ; OFF-NOT: muldivmark
 

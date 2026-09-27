@@ -787,10 +787,79 @@ SDValue MoeTargetLowering::LowerSELECT_CC(SDValue Op, SelectionDAG &DAG) const {
 // it into a real shift-and-add loop after instruction selection.
 //===----------------------------------------------------------------------===//
 
+// A multiply by a constant is not a multiply on this machine: it is a shift-
+// and-add sequence, and never worth the general loop. Candidate N5
+// (isa-evaluation.md's "L8 - priced"): the loop tests one multiplier bit per
+// iteration, about sixteen T-states a bit up to the constant's top bit, while
+// Horner's rule over the constant's non-adjacent form costs one ADD or SUB per
+// nonzero digit and a four-bit SHIFT per four bits between them. The worst
+// 32-bit constant is about eighty T-states that way; `memset`'s 0x01010101 was
+// 373 through the loop.
+//
+// It matters more than it looks because the compiler *makes* these: InstCombine
+// canonicalises `p |= p << 8; p |= p << 16` into `p * 0x01010101`, which is how
+// a memset written with shifts ended up paying for a multiply on every call.
+//
+// MOE_NO_SHIFT_ADD_MUL sends every multiply through the loop again, so the same
+// source can be built both ways and measured - the pairing MOE_NO_SHORT_FORM
+// and MOE_NO_SHORT_BRANCH exist for.
+static bool shiftAddMulDisabled() {
+  static const bool Disabled = std::getenv("MOE_NO_SHIFT_ADD_MUL") != nullptr;
+  return Disabled;
+}
+
+SDValue MoeTargetLowering::lowerMulByConstant(SDValue X, uint32_t C,
+                                              const SDLoc &dl,
+                                              SelectionDAG &DAG) const {
+  EVT VT = MVT::i32;
+  // Non-adjacent form, low digit first. A digit at bit 32 or above vanishes
+  // modulo 2^32, the multiply's own width, which is why -1 is one negation.
+  SmallVector<std::pair<unsigned, int>, 32> Digits;
+  uint64_t N = C;
+  for (unsigned I = 0; N && I < 32; ++I, N >>= 1) {
+    if (!(N & 1))
+      continue;
+    int D = (N & 3) == 3 ? -1 : 1;
+    Digits.push_back({I, D});
+    N = D > 0 ? N - 1 : N + 1;
+  }
+  if (Digits.empty())
+    return DAG.getConstant(0, dl, VT);
+
+  // Shifts go straight to LowerShifts's SHL1/2/4 chain rather than through an
+  // ISD::SHL: those are target nodes the combiner cannot see through, so it
+  // cannot fold the sequence back into the multiply it came from.
+  auto Shl = [&](SDValue V, unsigned Amount) {
+    if (!Amount)
+      return V;
+    SDValue Shift = DAG.getNode(ISD::SHL, dl, VT, V,
+                                DAG.getConstant(Amount, dl, VT));
+    return Shift.getOpcode() == ISD::SHL ? LowerShifts(Shift, DAG) : Shift;
+  };
+
+  auto [Top, TopSign] = Digits.back();
+  SDValue T = TopSign > 0 ? X
+                          : DAG.getNode(ISD::SUB, dl, VT,
+                                        DAG.getConstant(0, dl, VT), X);
+  unsigned At = Top;
+  for (auto It = std::next(Digits.rbegin()); It != Digits.rend(); ++It) {
+    T = Shl(T, At - It->first);
+    T = DAG.getNode(It->second > 0 ? ISD::ADD : ISD::SUB, dl, VT, T, X);
+    At = It->first;
+  }
+  return Shl(T, At);
+}
+
 SDValue MoeTargetLowering::LowerMUL(SDValue Op, SelectionDAG &DAG) const {
   SDLoc dl(Op);
   SDValue LHS = Op.getOperand(0);
   SDValue RHS = Op.getOperand(1);
+  if (!shiftAddMulDisabled()) {
+    if (auto *C = dyn_cast<ConstantSDNode>(RHS))
+      return lowerMulByConstant(LHS, uint32_t(C->getZExtValue()), dl, DAG);
+    if (auto *C = dyn_cast<ConstantSDNode>(LHS))
+      return lowerMulByConstant(RHS, uint32_t(C->getZExtValue()), dl, DAG);
+  }
   return SDValue(DAG.getMachineNode(Moe::MULPSEUDO, dl, MVT::i32, LHS, RHS),
                  0);
 }
