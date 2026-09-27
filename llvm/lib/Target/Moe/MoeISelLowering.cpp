@@ -919,6 +919,29 @@ SDValue MoeTargetLowering::LowerSDivRem(SDValue Op, SelectionDAG &DAG) const {
                        S);
   };
   SDValue SA = Sign(A);
+
+  // By a positive power of two it is shifts, not a divide: bias a negative
+  // dividend by 2^k - 1 so the arithmetic shift truncates towards zero. The
+  // generic combiner defers this whenever division is cheap, which on this
+  // machine it is only relatively.
+  if (auto *C = dyn_cast<ConstantSDNode>(B)) {
+    const APInt &D = C->getAPIntValue();
+    if (D.isPowerOf2() && D.ugt(1)) {
+      unsigned K = D.logBase2();
+      SDValue Bias = LowerShifts(
+          DAG.getNode(ISD::SRL, dl, VT, SA, DAG.getConstant(32 - K, dl, VT)),
+          DAG);
+      SDValue Biased = DAG.getNode(ISD::ADD, dl, VT, A, Bias);
+      if (Op.getOpcode() == ISD::SDIV)
+        return LowerShifts(
+            DAG.getNode(ISD::SRA, dl, VT, Biased, DAG.getConstant(K, dl, VT)),
+            DAG);
+      SDValue Rounded = DAG.getNode(ISD::AND, dl, VT, Biased,
+                                    DAG.getConstant(~(D - 1), dl, VT));
+      return DAG.getNode(ISD::SUB, dl, VT, A, Rounded);
+    }
+  }
+
   SDValue AbsA = Apply(A, SA);
   if (Op.getOpcode() == ISD::SREM) {
     SDValue AbsB = Apply(B, Sign(B));

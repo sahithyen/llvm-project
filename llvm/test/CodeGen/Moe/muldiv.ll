@@ -1,5 +1,5 @@
 ; RUN: llc < %s -mtriple=moe -O0 -verify-machineinstrs | FileCheck %s
-; RUN: llc < %s -mtriple=moe -O2 -verify-machineinstrs | FileCheck %s
+; RUN: llc < %s -mtriple=moe -O2 -verify-machineinstrs | FileCheck %s --check-prefixes=CHECK,OPT
 ;
 ; Candidate L8: MUL, MULHU, DIVU and REMU are MULDIV's four functions, so a
 ; variable multiply or unsigned divide is one instruction and no loop. A signed
@@ -62,4 +62,33 @@ define i32 @sdivremf(i32 %a, i32 %b) {
 define i64 @mul64(i64 %a, i64 %b) {
   %r = mul i64 %a, %b
   ret i64 %r
+}
+
+; A signed divide or remainder by a power of two stays shifts, at both widths,
+; once optimising (at -O0 the combiner that folds it does not run):
+; the kernel's 64-bit ones would otherwise be __divdi3/__moddi3 calls, which it
+; does not link against.
+; OPT-LABEL: sdiv4:
+; OPT-NOT: divu
+; OPT: shift.right.arith
+; OPT: move gp4 -> ia
+define i32 @sdiv4(i32 %a) {
+  %q = sdiv i32 %a, 4
+  ret i32 %q
+}
+
+; OPT-LABEL: srem8:
+; OPT-NOT: remu
+; OPT: move gp4 -> ia
+define i32 @srem8(i32 %a) {
+  %r = srem i32 %a, 8
+  ret i32 %r
+}
+
+; OPT-LABEL: sdiv64pow2:
+; OPT-NOT: __divdi3
+; OPT: move gp4 -> ia
+define i64 @sdiv64pow2(i64 %a) {
+  %q = sdiv i64 %a, 4096
+  ret i64 %q
 }

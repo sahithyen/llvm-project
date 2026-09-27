@@ -53,10 +53,24 @@ public:
   SDValue LowerOperation(SDValue Op, SelectionDAG &DAG) const override;
 
   /// MULDIV's divide is 37 T-states, and so is the high multiply that
-  /// magic-number division would replace it with - so a divide by a constant
-  /// stays a divide. See LowerMUL.
+  /// magic-number division would replace it with - so a 32-bit divide by a
+  /// constant stays a divide. A 64-bit one does not: there is no 64-bit
+  /// divide, and leaving it alone makes a __divdi3 call, which the kernel -
+  /// which relies on the multiply - does not even link against.
   bool isIntDivCheap(EVT VT, AttributeList Attr) const override {
-    return true;
+    return VT == MVT::i32;
+  }
+
+  /// ...but a signed divide or remainder by a power of two is a few shifts,
+  /// and the generic hooks give that up whenever division is "cheap". Always
+  /// take the shifts.
+  SDValue BuildSDIVPow2(SDNode *N, const APInt &Divisor, SelectionDAG &DAG,
+                        SmallVectorImpl<SDNode *> &Created) const override {
+    return SDValue();
+  }
+  SDValue BuildSREMPow2(SDNode *N, const APInt &Divisor, SelectionDAG &DAG,
+                        SmallVectorImpl<SDNode *> &Created) const override {
+    return SDValue();
   }
 
   // Inline asm (Milestone 15): only the "r" (any GP register) constraint -
