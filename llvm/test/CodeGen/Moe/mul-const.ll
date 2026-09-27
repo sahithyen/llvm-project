@@ -1,7 +1,8 @@
 ; A multiply by a constant is a shift-and-add sequence over the constant's
-; non-adjacent form (candidate N5), not the general loop; MOE_NO_SHIFT_ADD_MUL
-; puts the loop back. llvm-tests/run-arith-loops-test.sh is what checks the
-; answers - this checks the shape.
+; non-adjacent form (candidate N5) wherever that is cheaper than MULDIV's MUL
+; with the constant loaded (candidate L8); MOE_NO_SHIFT_ADD_MUL makes every one
+; a MUL. llvm-tests/run-arith-loops-test.sh is what checks the answers - this
+; checks the shape.
 ; RUN: llc -mtriple=moe -O2 -verify-machineinstrs < %s | FileCheck %s
 ; RUN: env MOE_NO_SHIFT_ADD_MUL=1 llc -mtriple=moe -O2 < %s \
 ; RUN:   | FileCheck %s --check-prefix=LOOP
@@ -15,7 +16,7 @@
 ; CHECK-NOT: jump
 ; CHECK: move gp4 -> ia
 ; LOOP-LABEL: broadcast:
-; LOOP: jump
+; LOOP: mul
 define i32 @broadcast(i32 %a) {
   %r = mul i32 %a, 16843009
   ret i32 %r
@@ -43,9 +44,17 @@ define i32 @negate(i32 %a) {
   ret i32 %r
 }
 
-; A variable multiply keeps the loop.
+; 0x55555555 has sixteen nonzero digits, which costs more than a MUL does.
+; CHECK-LABEL: dense:
+; CHECK: mul
+define i32 @dense(i32 %a) {
+  %r = mul i32 %a, 1431655765
+  ret i32 %r
+}
+
+; A variable multiply is a MUL.
 ; CHECK-LABEL: variable:
-; CHECK: jump
+; CHECK: mul
 define i32 @variable(i32 %a, i32 %b) {
   %r = mul i32 %a, %b
   ret i32 %r

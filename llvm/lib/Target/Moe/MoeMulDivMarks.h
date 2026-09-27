@@ -10,9 +10,10 @@
 // instruction that `moe-emu --profile` counts between, so that candidate L8
 // (hardware multiply/divide) can be priced from what the corpus actually runs.
 //
-// It exists because the thing being priced has no address to attribute: a
-// 32-bit MUL/UDIV/SDIV is expanded *inline* into a loop (emitMul, emitDivRem,
-// emitSDivRem), so a symbol-attributed profile cannot see it at all. L8's
+// It exists because the thing being priced had no address to attribute: a
+// 32-bit MUL/UDIV/SDIV was expanded *inline* into a loop, so a
+// symbol-attributed profile could not see it at all. On candidate L8's branch
+// those are MULDIV instructions and only the 64-bit helpers are marked. L8's
 // first bound, 7.87%, was three kernel helper functions and nothing else - no
 // inline loop anywhere and no userspace at all.
 //

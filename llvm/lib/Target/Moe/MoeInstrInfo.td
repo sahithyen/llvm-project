@@ -205,41 +205,6 @@ def RET : MoePseudo<(outs), (ins), "#RET", [(Moeret)]>;
 // same nothing here.
 def : Pat<(atomic_fence (timm), (timm)), (MEMBARRIER)>;
 
-// Software multiply (see the Milestone 3 plan's "Software multiply" section):
-// SHIFT moves exactly one bit per instruction and its carry-out is the bit
-// shifted out, so a shift-and-add loop can test each multiplier bit directly
-// off SHIFT's C flag, with no AND-with-1 masking step (AND is register-
-// register only anyway, so there's no immediate-mask instruction to use).
-// Expanded by MoeTargetLowering::emitMul into a real runtime loop of SHIFT/
-// ADD/INCREMENT/JCC - constructed directly as a machine node in LowerMUL
-// (not matched via a SelectionDAG Pat), so no pattern is needed here.
-let usesCustomInserter = 1 in
-def MULPSEUDO : MoePseudo<(outs GPR:$dst), (ins GPR:$a, GPR:$b),
-                           "#MUL $dst, $a, $b", []>;
-
-// Software unsigned divide/remainder (see the Milestone 3 plan's "Software
-// divide/remainder" section): a restoring binary long-division loop,
-// producing quotient and remainder together so UDIV/UREM of the same
-// operands share one loop. Each iteration shifts the dividend and remainder
-// together as one wide value via SHIFT's Carry-in chaining (SHLc, already
-// defined below - the same mechanic 'SHIFT' in the Instruction set chapter
-// describes for multi-word shifts), then compares the shifted remainder
-// against the divisor to decide the next quotient bit. Constructed directly
-// as a machine node in LowerUDIV/LowerUREM (not matched via a SelectionDAG
-// Pat), so no pattern is needed here.
-let usesCustomInserter = 1 in
-def DIVMODPSEUDO : MoePseudo<(outs GPR:$q, GPR:$r), (ins GPR:$a, GPR:$b),
-                              "#DIVMOD $q, $r, $a, $b", []>;
-
-// Software signed divide/remainder: wraps DIVMODPSEUDO's unsigned core with
-// sign correction (see the Milestone 3 plan's "Software divide/remainder"
-// section) - absolute-value the operands, run the same unsigned loop, then
-// negate the quotient if the operands' signs differed and the remainder if
-// the dividend was negative (C-style truncating-toward-zero division).
-let usesCustomInserter = 1 in
-def SDIVMODPSEUDO : MoePseudo<(outs GPR:$q, GPR:$r), (ins GPR:$a, GPR:$b),
-                               "#SDIVMOD $q, $r, $a, $b", []>;
-
 // Value-producing compare (Milestone 11): Moe has no CMP/SELECT/SETCC
 // instruction, only a flags-setting SUBcmp consumed by a conditional branch
 // (see BR_CC above) - so materializing a comparison's 0/1 result as a real
@@ -247,10 +212,8 @@ def SDIVMODPSEUDO : MoePseudo<(outs GPR:$q, GPR:$r), (ins GPR:$a, GPR:$b),
 // detection, and by ordinary C like `int f(int a,int b){return a<b;}`) needs
 // a real branchy sequence, not a single instruction. Constructed directly as
 // a machine node in LowerSETCC (not matched via a SelectionDAG Pat, same as
-// MULPSEUDO above), and expanded by MoeTargetLowering::emitSetCC into
-// SUBcmp+JCC+two 0/1-producing blocks merged by a PHI - the same shape
-// emitCondNegate already uses for "produce a value from a branch condition",
-// just testing $a against $b (with $cond) instead of a fixed sign test.
+// VARSHIFTPSEUDO below), and expanded by MoeTargetLowering::emitSetCC into
+// SUBcmp+JCC+two 0/1-producing blocks merged by a PHI.
 let usesCustomInserter = 1 in
 def SETCCPSEUDO : MoePseudo<(outs GPR:$dst), (ins GPR:$a, GPR:$b, i32imm:$cond),
                              "#SETCC $dst, $a, $b, $cond", []>;
@@ -269,12 +232,10 @@ def SELECTCCPSEUDO : MoePseudo<(outs GPR:$dst),
 // Software variable-amount shift (see the report_fatal_error this replaces in
 // MoeISelLowering::LowerShifts): SHIFT moves exactly one bit per instruction
 // with no shift-count field, so a shift by a runtime-computed amount needs a
-// runtime loop - the same shape as MULPSEUDO's loop but simpler (no
-// conditional add step, just one unconditional single-bit shift per
-// iteration). One pseudo shared by SHL/SRL/SRA, discriminated by an
+// runtime loop. One pseudo shared by SHL/SRL/SRA, discriminated by an
 // immediate opcode-selector operand (which real single-bit-shift opcode the
 // loop body should use), since the block-wiring is otherwise identical
-// across all three - mirrors DIVMODPSEUDO being shared by UDIV and UREM.
+// across all three.
 // Constructed directly as a machine node in LowerShifts's non-constant-amount
 // branch (not matched via a SelectionDAG Pat), so no pattern is needed here.
 let usesCustomInserter = 1 in
@@ -319,7 +280,7 @@ def MULDIVMARK : MoveForm<(outs), (ins AllReg:$from, i32imm:$mask),
 //===----------------------------------------------------------------------===//
 
 // Defs = [F] (here and on every other ALU-family instruction below - AND/OR/
-// XOR, INCREMENT, the SHIFT family, SUBcmp): real hardware sets the ALU
+// XOR, the SHIFT family, SUBcmp): real hardware sets the ALU
 // flags on every one of these, not just SUBcmp/SHIFT. F (the real, already-
 // defined architectural Flags register - see registers.md - already
 // permanently Reserved, so this never affects allocation) gives that a real,
@@ -494,17 +455,19 @@ def SRLc : ShiftForm<(outs GPR:$o), (ins GPR:$a), "shift.right.c $a -> $o", []>;
 }
 
 //===----------------------------------------------------------------------===//
-// INCREMENT (0b1011) - o can be any of the 16 registers, but Milestone 1
-// only ever targets it at GPR (stack-pointer adjustment uses SUB/ADD with a
-// literal-pool constant instead, per the Milestone 1 plan's FrameLowering
-// notes, since frame sizes can exceed INCREMENT's 6-bit/0-63 range).
+// MULDIV (0b1011) - candidate L8: one word of an unsigned multiply or divide,
+// by the Function field. F is untouched, so nothing here Defs it.
 //===----------------------------------------------------------------------===//
 
-let Defs = [F] in
-def INCREMENT : IncrementForm<(outs GPR:$o), (ins GPR:$oin, i32imm:$value),
-                               "increment $o += $value", []> {
-  let Constraints = "$o = $oin";
-}
+def MUL : MulDivForm<0b00, (outs GPR:$o), (ins GPR:$a, GPR:$b),
+                     "mul $a, $b -> $o", [(set GPR:$o, (mul GPR:$a, GPR:$b))]>;
+def MULHU : MulDivForm<0b01, (outs GPR:$o), (ins GPR:$a, GPR:$b),
+                       "mulhu $a, $b -> $o",
+                       [(set GPR:$o, (mulhu GPR:$a, GPR:$b))]>;
+def DIVU : MulDivForm<0b10, (outs GPR:$o), (ins GPR:$a, GPR:$b),
+                      "divu $a, $b -> $o", [(set GPR:$o, (udiv GPR:$a, GPR:$b))]>;
+def REMU : MulDivForm<0b11, (outs GPR:$o), (ins GPR:$a, GPR:$b),
+                      "remu $a, $b -> $o", [(set GPR:$o, (urem GPR:$a, GPR:$b))]>;
 
 //===----------------------------------------------------------------------===//
 // JUMP (0b0000) - conditional/unconditional branch. Condition AL (0) is
@@ -786,7 +749,7 @@ def POP_A  : PushPopForm<0b1000, (outs AllReg:$reg), (ins), "pop $reg", []>;
 // LOAD/STORE address operand, which already works via moeaddr_ri/SelectAddr
 // above - see the Milestone 6 plan's "FrameIndex-as-value" gap). Constructed
 // directly as a machine node by MoeISelDAGToDAG::Select's ISD::FrameIndex
-// case (mirroring how MULPSEUDO is built directly by LowerMUL, not
+// case (mirroring how SETCCPSEUDO is built directly by LowerSETCC, not
 // Pat-matched), carrying the same (TargetFrameIndex, disp) operand pair
 // SelectAddr already produces for the address-operand case, via moemem - so
 // eliminateFrameIndex's existing per-instruction offset computation applies

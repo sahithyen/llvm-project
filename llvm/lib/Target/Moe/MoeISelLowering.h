@@ -52,6 +52,13 @@ public:
 
   SDValue LowerOperation(SDValue Op, SelectionDAG &DAG) const override;
 
+  /// MULDIV's divide is 37 T-states, and so is the high multiply that
+  /// magic-number division would replace it with - so a divide by a constant
+  /// stays a divide. See LowerMUL.
+  bool isIntDivCheap(EVT VT, AttributeList Attr) const override {
+    return true;
+  }
+
   // Inline asm (Milestone 15): only the "r" (any GP register) constraint -
   // register operands only, no memory constraints, matching MoeAsmParser's
   // own scope (no memory-operand AsmParser support for inline asm to
@@ -72,10 +79,7 @@ public:
   SDValue LowerMUL(SDValue Op, SelectionDAG &DAG) const;
   SDValue lowerMulByConstant(SDValue X, uint32_t C, const SDLoc &dl,
                              SelectionDAG &DAG) const;
-  SDValue LowerUDIV(SDValue Op, SelectionDAG &DAG) const;
-  SDValue LowerUREM(SDValue Op, SelectionDAG &DAG) const;
-  SDValue LowerSDIV(SDValue Op, SelectionDAG &DAG) const;
-  SDValue LowerSREM(SDValue Op, SelectionDAG &DAG) const;
+  SDValue LowerSDivRem(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerExtLoad(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerVASTART(SDValue Op, SelectionDAG &DAG) const;
 
@@ -124,17 +128,10 @@ private:
                       SelectionDAG &DAG) const override;
 
   MachineBasicBlock *emitCall(MachineInstr &MI, MachineBasicBlock *BB) const;
-  MachineBasicBlock *emitMul(MachineInstr &MI, MachineBasicBlock *BB) const;
-  MachineBasicBlock *emitDivRem(MachineInstr &MI, MachineBasicBlock *BB) const;
-  MachineBasicBlock *emitSDivRem(MachineInstr &MI, MachineBasicBlock *BB) const;
   MachineBasicBlock *emitVarShift(MachineInstr &MI, MachineBasicBlock *BB) const;
   SDValue LowerDYNAMIC_STACKALLOC(SDValue Op, SelectionDAG &DAG) const;
   MachineBasicBlock *emitSetCC(MachineInstr &MI, MachineBasicBlock *BB) const;
   MachineBasicBlock *emitSelectCC(MachineInstr &MI, MachineBasicBlock *BB) const;
-  Register emitCondNegate(MachineFunction *MF, MachineRegisterInfo &MRI,
-                          const TargetInstrInfo *TII, const DebugLoc &DL,
-                          MachineBasicBlock *&BB, Register ZeroReg,
-                          Register TestReg, Register ValueReg) const;
 };
 
 } // namespace llvm

@@ -162,15 +162,19 @@ class AddSubForm<bits<4> opcode, dag outs, dag ins, string asmstr,
 }
 
 // INCREMENT (0b1011)
-class IncrementForm<dag outs, dag ins, string asmstr, list<dag> pattern>
+// MULDIV (0b1011) - candidate L8. Bit 11 is reserved.
+class MulDivForm<bits<2> function, dag outs, dag ins, string asmstr,
+                 list<dag> pattern>
     : MoeInst<outs, ins, asmstr, pattern> {
-  bits<2> size = 0b00;
-  bits<6> value;
-  bits<4> o;
+  bits<3> b;
+  bits<3> a;
+  bits<3> o;
   let Inst{15-12} = 0b1011;
-  let Inst{11-10} = size;
-  let Inst{9-4}   = value;
-  let Inst{3-0}   = o;
+  let Inst{11}    = 0; // n/a
+  let Inst{10-9}  = function;
+  let Inst{8-6}   = b;
+  let Inst{5-3}   = a;
+  let Inst{2-0}   = o;
 }
 
 // AND (0b1100) / OR (0b1101) / XOR (0b1110)
