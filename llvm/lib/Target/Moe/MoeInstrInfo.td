@@ -258,7 +258,14 @@ def VARSHIFTPSEUDO : MoePseudo<(outs GPR:$dst),
 // pattern shaped like `(set GPR:$to, GPR:$from)` has no discriminating
 // opcode, so it would wrongly match ANY i32-producing node (e.g. `add`),
 // not just an actual copy.
-let mask = 0b1111 in
+//
+// Bits 8-11 are reserved and written as zero, as 'Reserved bits' in the
+// Encoding chapter asks. They were MOVE's per-byte Mask until candidate S4
+// removed it, and this kept emitting 0b1111 - "copy every byte" - for four
+// months after, which the hardware ignored and a later revision of the ISA
+// would not have to: `moe-emu --profile`'s reserved.instruction.MOVE found it on
+// every MOVE in the corpus.
+let mask = 0 in
 def MOVE : MoveForm<(outs AllReg:$to), (ins AllReg:$from), "move $from -> $to", []>;
 
 // A pricing marker for candidate L8: `MOVE r -> r` with a code in the reserved
@@ -503,7 +510,7 @@ let isBranch = 1, isTerminator = 1 in {
 // writes on purpose - Linux's BPF interpreter is what needed it first, and it
 // is not optional there: CONFIG_NET selects BPF.
 let isBranch = 1, isIndirectBranch = 1, isTerminator = 1, isBarrier = 1,
-    Defs = [IA], mask = 0b1111 in
+    Defs = [IA], mask = 0 in
 def BRIND : MoveForm<(outs), (ins GPR:$from), "move $from -> ia",
                       [(brind GPR:$from)]> {
   // `from` is filled in from the operand of the same name, as MOVE's two are;

@@ -21,8 +21,11 @@
 // multiplier or divisor at a begin marker, so the profile can read the value
 // each operation actually ran with. Bits 8-11 are reserved (see 'Reserved
 // bits' in the Encoding chapter), so it is an architectural no-op, and the
-// compiler otherwise always emits them as 0b1111, so no ordinary instruction is
-// ever mistaken for one. It is not free: each is
+// compiler otherwise always emits them as zero and never emits a MOVE of a
+// register to itself, so no ordinary instruction is ever mistaken for one. It
+// is also the one thing this compiler emits that breaks that chapter's rule
+// that software writes reserved bits as zero, which is a second reason it must
+// stay off outside a pricing build. It is not free: each is
 // a MOVE's T-states, which the profile counts separately so that they can be
 // taken back out. Off by default, and it must stay off in anything that is
 // not a pricing build.
