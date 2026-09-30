@@ -68,6 +68,38 @@ FunctionPass *llvm::createMoeISelDag(MoeTargetMachine &TM,
   return new MoeDAGToDAGISelLegacy(TM, OptLevel);
 }
 
+// The value of a constant that LowerConstantPool has already turned into a
+// pool load, if `V` is one and it fits Register-indirect's 28-bit offset.
+//
+// Every ISD::Constant is lowered to `load (Wrapper (TargetConstantPool C))`
+// during legalization, because this ISA has no immediate - and legalization
+// runs before instruction selection. So by the time SelectAddr saw `p + 4` the
+// 4 was a load, and the ConstantSDNode case below never matched anything but a
+// frame index: every `p[k]` with k != 0 in the whole corpus was a pool LOAD, an
+// ADD and an access through `[reg+0]`, where the ISA carries the offset in the
+// operand for nothing. Found by unrolling the kernel's memset and reading what
+// came out (isa-evaluation.md, the pre-freeze pass).
+//
+// Only a *value* constant is recognised. An ISD::ConstantPool node - an address
+// into an aggregate - is lowered through a MoeConstantPoolValue instead, which
+// is a machine constant-pool entry and is refused here.
+static bool poolConstantOffset(SDValue V, int64_t &Offset) {
+  auto *LD = dyn_cast<LoadSDNode>(V);
+  if (!LD || !ISD::isNormalLoad(LD) || LD->getValueType(0) != MVT::i32)
+    return false;
+  SDValue Ptr = LD->getBasePtr();
+  if (Ptr.getOpcode() != MoeISD::Wrapper)
+    return false;
+  auto *CP = dyn_cast<ConstantPoolSDNode>(Ptr.getOperand(0));
+  if (!CP || CP->isMachineConstantPoolEntry())
+    return false;
+  auto *CI = dyn_cast<ConstantInt>(CP->getConstVal());
+  if (!CI || CI->getBitWidth() > 32)
+    return false;
+  Offset = CI->getSExtValue();
+  return isInt<28>(Offset);
+}
+
 bool MoeDAGToDAGISel::SelectAddr(SDValue Addr, SDValue &Base, SDValue &Disp) {
   // A Wrapper(TargetConstantPool/...) node is exactly LOADabs/STOREabs's own
   // pattern (Absolute addressing - see MoeInstrInfo.td's LOADabs) - reject
@@ -88,14 +120,26 @@ bool MoeDAGToDAGISel::SelectAddr(SDValue Addr, SDValue &Base, SDValue &Disp) {
     if (auto *FIN = dyn_cast<FrameIndexSDNode>(Addr.getOperand(0))) {
       if (auto *CN = dyn_cast<ConstantSDNode>(Addr.getOperand(1))) {
         Base = CurDAG->getTargetFrameIndex(FIN->getIndex(), Addr.getValueType());
-        Disp = CurDAG->getTargetConstant(CN->getSExtValue(), SDLoc(Addr), MVT::i32);
+        Disp = CurDAG->getSignedTargetConstant(CN->getSExtValue(), SDLoc(Addr), MVT::i32);
         return true;
       }
     }
     if (auto *CN = dyn_cast<ConstantSDNode>(Addr.getOperand(1))) {
       Base = Addr.getOperand(0);
-      Disp = CurDAG->getTargetConstant(CN->getSExtValue(), SDLoc(Addr), MVT::i32);
+      Disp = CurDAG->getSignedTargetConstant(CN->getSExtValue(), SDLoc(Addr), MVT::i32);
       return true;
+    }
+    // The same, for a constant already lowered to a pool load - either
+    // operand, since ADD commutes and nothing canonicalises a load to the right.
+    for (unsigned I = 0; I != 2; ++I) {
+      int64_t Offset;
+      SDValue Other = Addr.getOperand(1 - I);
+      if (poolConstantOffset(Addr.getOperand(I), Offset) &&
+          Other.getOpcode() != MoeISD::Wrapper) {
+        Base = Other;
+        Disp = CurDAG->getSignedTargetConstant(Offset, SDLoc(Addr), MVT::i32);
+        return true;
+      }
     }
   }
 
