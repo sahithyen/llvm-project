@@ -158,6 +158,16 @@ MoeTargetLowering::MoeTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::SRL_PARTS, MVT::i32, Expand);
   setOperationAction(ISD::SRA_PARTS, MVT::i32, Expand);
 
+  // A 64-bit add or subtract is two instructions, the second with Carry in:
+  // ADDC/SUBC become ADD/SUB, which set C, and ADDE/SUBE become add.c/sub.c,
+  // which consume it - glued, so nothing that sets F lands between them.
+  // Without these the type legalizer recovered the carry with a compare and a
+  // branch. SUB's C is "no borrow" and sub.c adds it (A + NOT B + C), which is
+  // exactly A - B - borrow, so the glued pair is a correct subtraction; the
+  // ISA's Carry in was inverted for SUB until 2026-09-30 and could not chain.
+  for (auto Op : {ISD::ADDC, ISD::ADDE, ISD::SUBC, ISD::SUBE})
+    setOperationAction(Op, MVT::i32, Legal);
+
   setOperationAction(ISD::STACKSAVE, MVT::Other, Expand);
   setOperationAction(ISD::STACKRESTORE, MVT::Other, Expand);
 

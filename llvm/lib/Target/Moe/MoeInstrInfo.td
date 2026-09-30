@@ -314,11 +314,9 @@ def SUB : AddSubForm<0b1010, (outs GPR:$o), (ins GPR:$a, GPR:$b),
 
 // ADD and SUB with Carry in enabled - see 'Flags' in the Encoding chapter,
 // which is how a multi-word addition or subtraction chains. Instruction
-// selection does not use them (64-bit arithmetic is lowered through
-// comparisons today), but hand-written multi-word arithmetic does: the
-// kernel's 64-bit multiply and divide helpers are two-instruction 64-bit adds
-// and subtracts with these, where C would otherwise need a compare and a
-// branch to propagate.
+// selection reaches them through ADDE/SUBE, the second half of a 64-bit add
+// or subtract (see the patterns after SUBcmp); hand-written multi-word
+// arithmetic - the kernel's 64-bit helpers - uses them directly.
 let carryin = 1, Uses = [F] in {
 def ADDc : AddSubForm<0b1001, (outs GPR:$o), (ins GPR:$a, GPR:$b),
                        "add.c $a, $b -> $o", []>;
@@ -364,6 +362,14 @@ def SUBc : AddSubForm<0b1010, (outs GPR:$o), (ins GPR:$a, GPR:$b),
 let isCompare = 1, o = 0, Defs = [GP0, F], hasSideEffects = 1 in
 def SUBcmp : AddSubForm<0b1010, (outs), (ins GPR:$a, GPR:$b),
                          "sub $a, $b -> (dead)", [(Moecmp GPR:$a, GPR:$b)]>;
+
+// A 64-bit add or subtract, split by the type legalizer into a glued pair:
+// the low words set C, the high words take it. ADD and SUB define F and
+// add.c/sub.c use it, which is what turns the glue into a real dependency.
+def : Pat<(addc GPR:$a, GPR:$b), (ADD GPR:$a, GPR:$b)>;
+def : Pat<(subc GPR:$a, GPR:$b), (SUB GPR:$a, GPR:$b)>;
+def : Pat<(adde GPR:$a, GPR:$b), (ADDc GPR:$a, GPR:$b)>;
+def : Pat<(sube GPR:$a, GPR:$b), (SUBc GPR:$a, GPR:$b)>;
 
 //===----------------------------------------------------------------------===//
 // AND (0b1100) / OR (0b1101) / XOR (0b1110)
